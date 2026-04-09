@@ -16,32 +16,7 @@ import h5py
 from typing import Tuple, Dict, Optional
 
 
-# Configuration
-
-class DataConfig:
-    """Dataset generation configuration."""
-    n_S = 256
-    n_t = 64
-    S_min = 1e-3
-
-    sigma_min = 0.05;  sigma_max = 0.80
-    r_min = 0.0;       r_max = 0.15
-    K_min = 20.0;      K_max = 200.0
-    T_min = 0.1;       T_max = 2.0
-
-    t_sampling_power = 2.0
-    n_samples = 100_000
-    batch_size = 1024
-    output_dir = './data'
-    output_filename = 'fno_option_pricing.h5'
-    seed = 42
-    n_jobs = 4
-
-    # Importance sampling concentration
-    # Higher = more samples near ATM / near-expiry
-    atm_concentration = 2.0     # K sampling sharpness around S_ref
-    expiry_concentration = 1.5  # T sampling sharpness near lower bound
-
+from config import Config
 
 # Sampling: Latin Hypercube + Importance
 
@@ -125,7 +100,7 @@ def importance_sample_T(n_samples: int,
 
 
 def generate_parameters(n_samples: int,
-                        config: DataConfig) -> np.ndarray:
+                        config: Config) -> np.ndarray:
     """
     Generate (σ, r, K, T) using LHS for (σ, r) + importance sampling for (K, T).
 
@@ -303,7 +278,7 @@ def generate_full_dataset(n_samples: int,
                           batch_size: int,
                           S_grid: np.ndarray,
                           t_template: np.ndarray,
-                          config: DataConfig,
+                          config: Config,
                           verbose: bool = True) -> Tuple:
     """Generate full dataset in batches with LHS + importance sampling."""
     n_batches = int(np.ceil(n_samples / batch_size))
@@ -332,9 +307,10 @@ def generate_full_dataset(n_samples: int,
         actual = be - bs
 
         # Sample parameters for this batch (offset seed per batch)
-        config_copy = DataConfig()
+        config_copy = Config()
         for k, v in config.__dict__.items():
-            setattr(config_copy, k, v)
+            if not k.startswith('__'):
+                setattr(config_copy, k, v)
         config_copy.seed = config.seed + i * 1000
         batch_params = generate_parameters(actual, config_copy)
 
@@ -399,11 +375,11 @@ def save_splits(params, V, Delta, Gamma, S_grid, t_template, config,
         'test': idx[n_train + n_val:]
     }
 
-    os.makedirs(config.output_dir, exist_ok=True)
+    os.makedirs(config.data_dir, exist_ok=True)
     paths = {}
 
     for name, indices in splits.items():
-        path = os.path.join(config.output_dir, f'{name}.h5')
+        path = os.path.join(config.data_dir, f'{name}.h5')
         with h5py.File(path, 'w') as f:
             f.create_dataset('params', data=params[indices], compression='gzip', compression_opts=4)
             f.create_dataset('V', data=V[indices], compression='gzip', compression_opts=4)
@@ -474,21 +450,9 @@ def validate_dataset(params, V, S_grid, t_template, n_check=100, seed=123):
 
 # Main
 
-def main(config: Optional[DataConfig] = None):
+def generate_data(config: Optional[Config] = None):
     if config is None:
-        config = DataConfig()
-
-    parser = argparse.ArgumentParser(description='FNO option pricing dataset')
-    parser.add_argument('--n_samples', type=int, default=config.n_samples)
-    parser.add_argument('--batch_size', type=int, default=config.batch_size)
-    parser.add_argument('--output_dir', type=str, default=config.output_dir)
-    parser.add_argument('--seed', type=int, default=config.seed)
-    args = parser.parse_args()
-
-    config.n_samples = args.n_samples
-    config.batch_size = args.batch_size
-    config.output_dir = args.output_dir
-    config.seed = args.seed
+        config = Config()
 
     t0 = time.perf_counter()
 
@@ -496,20 +460,20 @@ def main(config: Optional[DataConfig] = None):
     print("NEURAL OPERATOR DATASET GENERATOR")
     print(f"{'='*60}")
 
-    S_grid = create_s_grid(config.S_min, config.K_max, config.n_S)
-    t_template = create_t_template(config.n_t, config.t_sampling_power)
+    S_grid = create_s_grid(config.S_min, config.K_max, config.S_grid_size)
+    t_template = create_t_template(config.t_grid_size, config.t_sampling_power)
 
-    print(f"S_grid: [{S_grid.min():.4f}, {S_grid.max():.4f}] ({config.n_S} pts, linear)")
-    print(f"t_template: [0, 1] ({config.n_t} pts, power={config.t_sampling_power})")
+    print(f"S_grid: [{S_grid.min():.4f}, {S_grid.max():.4f}] ({config.S_grid_size} pts, linear)")
+    print(f"t_template: [0, 1] ({config.t_grid_size} pts, power={config.t_sampling_power})")
 
     params, V, Delta, Gamma = generate_full_dataset(
-        config.n_samples, config.batch_size, S_grid, t_template, config
+        config.n_samples, config.batch_size_data, S_grid, t_template, config
     )
 
     validate_dataset(params, V, S_grid, t_template, n_check=100)
 
     save_to_hdf5(params, V, Delta, Gamma, S_grid, t_template,
-                 os.path.join(config.output_dir, config.output_filename), config)
+                 os.path.join(config.data_dir, config.output_filename), config)
 
     print(f"\n{'='*60}")
     print("SAVING SPLITS (80/10/10)")
@@ -521,10 +485,10 @@ def main(config: Optional[DataConfig] = None):
     print(f"SUMMARY")
     print(f"{'='*60}")
     print(f"  Samples:     {config.n_samples:,}")
-    print(f"  Grid:        {config.n_S} × {config.n_t}")
+    print(f"  Grid:        {config.S_grid_size} × {config.t_grid_size}")
     print(f"  Time:        {elapsed:.1f}s ({config.n_samples/elapsed:.0f} samp/s)")
     print(f"{'='*60}")
 
 
 if __name__ == '__main__':
-    main()
+    generate_data()

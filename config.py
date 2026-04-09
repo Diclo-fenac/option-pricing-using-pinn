@@ -2,6 +2,7 @@
 Experiment configuration
 """
 import torch
+import os
 
 class Config:
     # =============================================================================
@@ -9,10 +10,10 @@ class Config:
     # =============================================================================
     S_grid_size = 256          # Asset price grid points
     t_grid_size = 64           # Time grid points
-    S_min = 50.0               # Minimum asset price
-    S_max = 150.0              # Maximum asset price (centered around S0=100)
-    t_min = 0.0                # Time to expiry (expiry)
-    t_max = 2.0                # Maximum time to expiry (2 years)
+    S_min = 1e-3               # Minimum asset price
+    S_max = 600.0              # Maximum asset price
+    T_min = 0.1                # Minimum time to expiry
+    T_max = 2.0                # Maximum time to expiry (2 years)
     
     # Non-uniform time sampling: cluster points near expiry
     t_sampling_power = 2.0     # Higher = more clustering near t=0 (expiry)
@@ -20,21 +21,21 @@ class Config:
     # =============================================================================
     # Parameter ranges for operator training
     # =============================================================================
-    sigma_min = 0.10           # Minimum volatility
+    sigma_min = 0.05           # Minimum volatility
     sigma_max = 0.80           # Maximum volatility
     r_min = 0.00               # Minimum risk-free rate
-    r_max = 0.10               # Maximum risk-free rate
-    K_min = 0.7                # Minimum strike (as fraction of S0)
-    K_max = 1.3                # Maximum strike (as fraction of S0)
+    r_max = 0.15               # Maximum risk-free rate
+    K_min = 20.0               # Minimum strike
+    K_max = 200.0              # Maximum strike
     
-    # =============================================================================
-    # Dataset
-    # =============================================================================
-    n_train_samples = 10000    # Number of (σ, r, K) combinations for training
-    n_val_samples = 2000       # Validation samples
-    n_test_samples = 2000      # Test samples
-    S0 = 100.0                 # Reference spot price
-    
+    # Dataset Generation settings
+    n_samples = 100000         # Number of samples
+    batch_size_data = 1024
+    output_filename = 'fno_option_pricing.h5'
+    atm_concentration = 2.0
+    expiry_concentration = 1.5
+    seed = 42
+
     # =============================================================================
     # FNO Architecture
     # =============================================================================
@@ -51,6 +52,7 @@ class Config:
     learning_rate = 1e-3
     weight_decay = 1e-4
     n_epochs = 200
+    patience = 25
     scheduler_step = 50
     scheduler_gamma = 0.5
     
@@ -58,6 +60,17 @@ class Config:
     lambda_pde = 0.1           # Weight for PDE residual loss
     lambda_bc = 0.1            # Weight for boundary condition loss
     
+    # Dataloader / multiprocessing (set lower/disabled for notebook stability)
+    num_workers = 0
+    pin_memory = False
+    persistent_workers = False
+    num_threads = 0
+    num_interop_threads = 0
+    
+    # Logging
+    use_wandb = False
+    wandb_project = 'fno-option-pricer'
+
     # =============================================================================
     # Paths
     # =============================================================================

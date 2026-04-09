@@ -753,71 +753,24 @@ def load_model(config, path):
     return model, device
 
 
-# CLI
-
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Train FNO option pricer')
-    parser.add_argument('--data_dir', type=str, default='./data')
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
-    parser.add_argument('--wandb_project', type=str, default='fno-option-pricer', help='WandB project name')
-    parser.add_argument('--num_workers', type=int, default=0, help='DataLoader num_workers (multiprocessing)')
-    parser.add_argument('--pin_memory', action='store_true', help='Use pin_memory for DataLoader')
-    parser.add_argument('--persistent_workers', action='store_true', help='Use persistent_workers for DataLoader')
-    parser.add_argument('--num_threads', type=int, default=0, help='torch.set_num_threads (0 = leave default)')
-    parser.add_argument('--num_interop_threads', type=int, default=0, help='torch.set_num_interop_threads (0 = leave default)')
-    args = parser.parse_args()
-
-    # Minimal config object for the trainer
-    class TrainConfig:
-        def __init__(self, args):
-            self.device = args.device
-            self.batch_size = args.batch_size
-            self.learning_rate = args.lr
-            self.weight_decay = 1e-4
-            self.n_epochs = args.epochs
-            self.fno_modes = 12
-            self.fno_layers = 3
-            self.fno_width = 64
-            self.S_grid_size = 256
-            self.t_grid_size = 64
-            self.S_min = 1e-3
-            self.S_max = 600.0
-            self.T_max = 2.0
-            self.t_sampling_power = 2.0
-            self.checkpoint_dir = './checkpoints'
-            self.results_dir = './results'
-            # DataLoader / threading
-            self.num_workers = args.num_workers
-            self.pin_memory = args.pin_memory
-            self.persistent_workers = args.persistent_workers
-            self.num_threads = args.num_threads
-            self.num_interop_threads = args.num_interop_threads
-
-    config = TrainConfig(args)
+def train_model(config):
+    import h5py
 
     # Apply thread settings if provided
-    if config.num_threads and config.num_threads > 0:
+    if hasattr(config, 'num_threads') and config.num_threads > 0:
         try:
             torch.set_num_threads(config.num_threads)
         except Exception:
             pass
-    if config.num_interop_threads and config.num_interop_threads > 0:
+    if hasattr(config, 'num_interop_threads') and config.num_interop_threads > 0:
         try:
             torch.set_num_interop_threads(config.num_interop_threads)
         except Exception:
             pass
 
     # Load data
-    import h5py
-
-    train_path = os.path.join(args.data_dir, 'train.h5')
-    val_path = os.path.join(args.data_dir, 'val.h5')
+    train_path = os.path.join(config.data_dir, 'train.h5')
+    val_path = os.path.join(config.data_dir, 'val.h5')
 
     # Auto-detect data format and return appropriate Dataset class
     def _make_dataset(path):
@@ -859,12 +812,11 @@ if __name__ == '__main__':
     val_ds = _make_dataset(val_path)
 
     # Initialize WandB if requested
-    if args.wandb:
+    if hasattr(config, 'use_wandb') and config.use_wandb:
         if not _HAS_WANDB:
             raise RuntimeError('wandb package not available; install with `pip install wandb`')
-        config.use_wandb = True
         # Initialize run with a minimal config
-        wandb.init(project=args.wandb_project if args.wandb_project else 'fno-option-pricer', config={
+        wandb.init(project=config.wandb_project if hasattr(config, 'wandb_project') else 'fno-option-pricer', config={
             'batch_size': config.batch_size,
             'lr': config.learning_rate,
             'epochs': config.n_epochs,
@@ -872,18 +824,23 @@ if __name__ == '__main__':
             'fno_layers': config.fno_layers,
             'fno_width': config.fno_width,
         })
-    else:
-        config.use_wandb = False
 
     # Make DataLoader options explicit and configurable
     trainer = FNOTrainer(config)
     history = trainer.train(train_ds, val_ds)
 
     # Final artifact upload
-    if config.use_wandb and _HAS_WANDB:
+    if hasattr(config, 'use_wandb') and config.use_wandb and _HAS_WANDB:
         try:
             wandb.save(os.path.join(config.results_dir, 'training.png'))
             wandb.save(os.path.join(config.results_dir, 'history.npy'))
             wandb.finish()
         except Exception:
             pass
+
+    return history
+
+
+if __name__ == '__main__':
+    from config import Config
+    train_model(Config())
