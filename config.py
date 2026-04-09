@@ -1,0 +1,72 @@
+"""
+Experiment configuration
+"""
+import torch
+
+class Config:
+    # =============================================================================
+    # Grid settings
+    # =============================================================================
+    S_grid_size = 256          # Asset price grid points
+    t_grid_size = 64           # Time grid points
+    S_min = 50.0               # Minimum asset price
+    S_max = 150.0              # Maximum asset price (centered around S0=100)
+    t_min = 0.0                # Time to expiry (expiry)
+    t_max = 2.0                # Maximum time to expiry (2 years)
+    
+    # Non-uniform time sampling: cluster points near expiry
+    t_sampling_power = 2.0     # Higher = more clustering near t=0 (expiry)
+    
+    # =============================================================================
+    # Parameter ranges for operator training
+    # =============================================================================
+    sigma_min = 0.10           # Minimum volatility
+    sigma_max = 0.80           # Maximum volatility
+    r_min = 0.00               # Minimum risk-free rate
+    r_max = 0.10               # Maximum risk-free rate
+    K_min = 0.7                # Minimum strike (as fraction of S0)
+    K_max = 1.3                # Maximum strike (as fraction of S0)
+    
+    # =============================================================================
+    # Dataset
+    # =============================================================================
+    n_train_samples = 10000    # Number of (σ, r, K) combinations for training
+    n_val_samples = 2000       # Validation samples
+    n_test_samples = 2000      # Test samples
+    S0 = 100.0                 # Reference spot price
+    
+    # =============================================================================
+    # FNO Architecture
+    # =============================================================================
+    fno_modes = 12             # Number of Fourier modes
+    fno_layers = 3             # Number of Fourier layers
+    fno_width = 64             # Channel width
+    fno_nonlinearity = 'gelu'  # Activation function
+    
+    # =============================================================================
+    # Training
+    # =============================================================================
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    batch_size = 32
+    learning_rate = 1e-3
+    weight_decay = 1e-4
+    n_epochs = 200
+    scheduler_step = 50
+    scheduler_gamma = 0.5
+    
+    # Physics-informed loss weight
+    lambda_pde = 0.1           # Weight for PDE residual loss
+    lambda_bc = 0.1            # Weight for boundary condition loss
+    
+    # =============================================================================
+    # Paths
+    # =============================================================================
+    data_dir = './data'
+    checkpoint_dir = './checkpoints'
+    results_dir = './results'
+    
+    # =============================================================================
+    # Benchmarking
+    # =============================================================================
+    n_mc_paths = 100000        # Monte Carlo paths for benchmarking
+    mc_seed = 42
