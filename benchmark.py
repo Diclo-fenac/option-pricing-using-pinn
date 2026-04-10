@@ -831,22 +831,25 @@ def run_full_benchmark(config, data_path=None, model_path=None):
 
 if __name__ == '__main__':
     import argparse
+    from config import Config
 
     parser = argparse.ArgumentParser(description='Benchmark FNO option pricer')
-    parser.add_argument('--data_path', type=str, default='./data/test.h5')
-    parser.add_argument('--model_path', type=str, default='./checkpoints/best.pt')
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--output_dir', type=str, default='./results')
+    parser.add_argument('--data_path', type=str, default=None)
+    parser.add_argument('--model_path', type=str, default=None)
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--output_dir', type=str, default=None)
+    parser.add_argument('--run_name', type=str, default=None)
     args = parser.parse_args()
 
-    class BenchConfig:
-        device = args.device
-        fno_modes = 12
-        fno_layers = 3
-        fno_width = 64
-        S_grid_size = 256
-        t_grid_size = 64
+    config = Config()
+    
+    # Apply CLI overrides
+    if args.device: config.device = args.device
+    if args.output_dir: config.results_dir = args.output_dir
+    if args.run_name: config.run_name = args.run_name
+    
+    # Default paths using run_name
+    data_path = args.data_path if args.data_path else os.path.join(config.data_dir, 'test.h5')
+    model_path = args.model_path if args.model_path else os.path.join(config.checkpoint_dir, f"{config.run_name}_best.pt")
 
-    config = BenchConfig()
-
-    run_full_benchmark(config, data_path=args.data_path, model_path=args.model_path)
+    run_full_benchmark(config, data_path=data_path, model_path=model_path)
