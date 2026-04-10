@@ -70,6 +70,7 @@ class Config:
     # Logging
     use_wandb = False
     wandb_project = 'fno-option-pricer'
+    run_benchmark = True                 # Automatically run benchmark after training
 
     # =============================================================================
     # Paths and Cloud Storage

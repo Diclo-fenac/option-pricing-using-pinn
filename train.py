@@ -883,6 +883,14 @@ def train_model(config):
                 dest_blob = f"models/{run_name}/{full_name}"
                 upload_to_gcp_bucket(path, config.gcp_bucket_name, dest_blob, config.gcp_service_account_path)
 
+    # Optional: Run full benchmark suite immediately after training
+    if hasattr(config, 'run_benchmark') and config.run_benchmark:
+        print(f"\n{'='*60}")
+        print("STARTING AUTOMATIC BENCHMARK")
+        print(f"{'='*60}")
+        # Pass the newly created run_name to the benchmark
+        run_full_benchmark(config)
+
     return history
 
 
