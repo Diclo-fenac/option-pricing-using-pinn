@@ -845,7 +845,7 @@ def train_model(config):
         if not _HAS_WANDB:
             raise RuntimeError('wandb package not available; install with `pip install wandb`')
         # Initialize run with a minimal config
-        wandb.init(project=config.wandb_project if hasattr(config, 'wandb_project') else 'fno-option-pricer', config={
+        run = wandb.init(project=config.wandb_project if hasattr(config, 'wandb_project') else 'fno-option-pricer', config={
             'batch_size': config.batch_size,
             'lr': config.learning_rate,
             'epochs': config.n_epochs,
@@ -853,6 +853,8 @@ def train_model(config):
             'fno_layers': config.fno_layers,
             'fno_width': config.fno_width,
         })
+        # Override run_name with WandB run name
+        config.run_name = run.name
 
     # Make DataLoader options explicit and configurable
     trainer = FNOTrainer(config)
@@ -866,6 +868,20 @@ def train_model(config):
             wandb.finish()
         except Exception:
             pass
+
+    # GCP Upload of the models after training completes
+    if hasattr(config, 'gcp_bucket_name') and config.gcp_bucket_name and \
+       hasattr(config, 'gcp_service_account_path') and config.gcp_service_account_path:
+        from utils import upload_to_gcp_bucket
+        run_name = config.run_name if hasattr(config, 'run_name') else 'model'
+        d = config.checkpoint_dir if hasattr(config, 'checkpoint_dir') else './checkpoints'
+        
+        for name in ['best', 'final']:
+            full_name = f'{run_name}_{name}.pt'
+            path = os.path.join(d, full_name)
+            if os.path.exists(path):
+                dest_blob = f"models/{run_name}/{full_name}"
+                upload_to_gcp_bucket(path, config.gcp_bucket_name, dest_blob, config.gcp_service_account_path)
 
     return history
 
