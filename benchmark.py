@@ -822,6 +822,56 @@ def run_full_benchmark(config, data_path=None, model_path=None):
     np.save(os.path.join(output_dir, 'benchmark_results.npy'), results)
     print(f"\nAll results → {output_dir}/benchmark_results.npy")
 
+    # ── 10. W&B Logging ──
+    if hasattr(config, 'use_wandb') and config.use_wandb:
+        try:
+            import wandb
+            # Re-init or resume the run using the run_name/id
+            # Note: This assumes you are running benchmark right after training or providing the run name
+            wandb.init(project=getattr(config, 'wandb_project', 'fno-option-pricer'), 
+                       name=config.run_name, resume="allow")
+            
+            # Log main metrics
+            wandb.log({
+                'bench/rmse': accuracy['rmse'],
+                'bench/mape': accuracy['mape'],
+                'bench/max_error': accuracy['max_error'],
+                'bench/fno_speed_ms': fno_time * 1000.0,
+                'bench/speedup_vs_mc': mc_time / fno_time,
+                'bench/delta_rmse': greeks['delta_rmse'],
+                'bench/gamma_rmse': greeks['gamma_rmse'],
+                'bench/pde_residual_mean': pde_res['mean']
+            })
+            
+            # Log plots as images
+            wandb.log({
+                "plots/surface_comparison": wandb.Image(os.path.join(output_dir, 'surface_comparison.png')),
+                "plots/price_curves": wandb.Image(os.path.join(output_dir, 'price_curves.png')),
+                "plots/error_histogram": wandb.Image(os.path.join(output_dir, 'error_histogram.png'))
+            })
+            print("Results logged to Weights & Biases.")
+        except Exception as e:
+            print(f"Failed to log to W&B: {e}")
+
+    # ── 11. GCP Upload ──
+    if hasattr(config, 'gcp_bucket_name') and config.gcp_bucket_name and \
+       hasattr(config, 'gcp_service_account_path') and config.gcp_service_account_path:
+        from utils import upload_to_gcp_bucket
+        run_name = config.run_name if hasattr(config, 'run_name') else 'model'
+        
+        files_to_upload = [
+            'benchmark_results.npy', 
+            'surface_comparison.png', 
+            'price_curves.png', 
+            'error_histogram.png'
+        ]
+        
+        for f in files_to_upload:
+            local_p = os.path.join(output_dir, f)
+            if os.path.exists(local_p):
+                dest_blob = f"results/{run_name}/{f}"
+                upload_to_gcp_bucket(local_p, config.gcp_bucket_name, dest_blob, config.gcp_service_account_path)
+
     return results
 
 
