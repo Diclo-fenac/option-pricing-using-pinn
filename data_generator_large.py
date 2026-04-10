@@ -388,6 +388,12 @@ def save_splits(params, V, Delta, Gamma, S_grid, t_template, config,
             f.attrs['n_samples'] = len(indices)
         paths[name] = path
         print(f"  {name:5s}: {len(indices):,} → {path} ({os.path.getsize(path)/1e6:.1f} MB)")
+        
+        if hasattr(config, 'gcp_bucket_name') and config.gcp_bucket_name and \
+           hasattr(config, 'gcp_service_account_path') and config.gcp_service_account_path:
+            from utils import upload_to_gcp_bucket
+            dest_blob = f"data/{name}.h5"
+            upload_to_gcp_bucket(path, config.gcp_bucket_name, dest_blob, config.gcp_service_account_path)
 
     return paths
 
@@ -489,3 +495,4 @@ def generate_data(config: Optional[Config] = None):
 
 if __name__ == '__main__':
     generate_data()
+_data()

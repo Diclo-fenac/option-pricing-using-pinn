@@ -204,3 +204,38 @@ def compute_mape(pred, true, eps=1e-8):
 def compute_max_error(pred, true):
     """Maximum Absolute Error"""
     return torch.max(torch.abs(pred - true))
+
+
+# =============================================================================
+# Cloud Storage Helpers
+# =============================================================================
+
+def upload_to_gcp_bucket(local_file_path, bucket_name, destination_blob_name, service_account_json_path):
+    """
+    Uploads a file to a Google Cloud Storage bucket using a service account.
+    """
+    try:
+        from google.cloud import storage
+        from google.oauth2 import service_account
+        import os
+        
+        if not os.path.exists(local_file_path):
+            print(f"File not found: {local_file_path}")
+            return False
+            
+        credentials = service_account.Credentials.from_service_account_file(service_account_json_path)
+        client = storage.Client(credentials=credentials, project=credentials.project_id)
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+        
+        print(f"Uploading {local_file_path} to gs://{bucket_name}/{destination_blob_name} ...")
+        blob.upload_from_filename(local_file_path)
+        print(f"Upload complete.")
+        return True
+    except ImportError:
+        print("google-cloud-storage package is not installed. Run: pip install google-cloud-storage")
+        return False
+    except Exception as e:
+        print(f"Failed to upload to GCP: {e}")
+        return False
+

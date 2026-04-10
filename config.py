@@ -72,11 +72,16 @@ class Config:
     wandb_project = 'fno-option-pricer'
 
     # =============================================================================
-    # Paths
+    # Paths and Cloud Storage
     # =============================================================================
+    run_name = 'fno_model_v1'  # Identifier for this specific training run
     data_dir = './data'
     checkpoint_dir = './checkpoints'
     results_dir = './results'
+    
+    # GCP Settings
+    gcp_bucket_name = None               # e.g., 'my-option-pricing-bucket'
+    gcp_service_account_path = None      # e.g., './service-account-key.json'
     
     # =============================================================================
     # Benchmarking

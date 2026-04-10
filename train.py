@@ -615,9 +615,11 @@ class FNOTrainer:
         return self.history
 
     def save(self, name):
-        """Save checkpoint."""
+        """Save checkpoint and optionally upload to GCP."""
         d = self.config.checkpoint_dir if hasattr(self.config, 'checkpoint_dir') else './checkpoints'
-        path = os.path.join(d, f'{name}.pt')
+        run_name = self.config.run_name if hasattr(self.config, 'run_name') else 'model'
+        full_name = f'{run_name}_{name}.pt'
+        path = os.path.join(d, full_name)
         torch.save({
             'model': self.model.state_dict(),
             'optim': self.optimizer.state_dict(),
@@ -630,6 +632,13 @@ class FNOTrainer:
                 wandb.save(path)
             except Exception:
                 pass
+                
+        # GCP Upload
+        if hasattr(self.config, 'gcp_bucket_name') and self.config.gcp_bucket_name and \
+           hasattr(self.config, 'gcp_service_account_path') and self.config.gcp_service_account_path:
+            from utils import upload_to_gcp_bucket
+            dest_blob = f"models/{run_name}/{full_name}"
+            upload_to_gcp_bucket(path, self.config.gcp_bucket_name, dest_blob, self.config.gcp_service_account_path)
 
     def _final_evaluation(self, dataloader):
         """Compute final evaluation metrics on provided dataloader.
