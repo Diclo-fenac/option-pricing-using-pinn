@@ -148,7 +148,10 @@ class CoordinateDecoder(nn.Module):
         batch, n_S, n_t, feat_dim = features.shape
 
         # Normalize coordinates to [0, 1] for stable Fourier embedding
-        S_norm = (S_grid - S_grid.min()) / (S_grid.max() - S_grid.min() + 1e-8)
+        # Use log-price transform for S to better resolve OTM regions
+        S_log = torch.log(S_grid + 1e-6)
+        S_norm = (S_log - S_log.min()) / (S_log.max() - S_log.min() + 1e-8)
+        
         t_norm = (t_grid - t_grid.min()) / (t_grid.max() - t_grid.min() + 1e-8)
 
         # Coordinate meshgrid
@@ -314,7 +317,12 @@ class FNOOptionPricer(nn.Module):
         K_f = K_norm.view(batch_size, 1, 1, 1).expand(-1, -1, self.n_S, self.n_t)
         T_f = T_norm.view(batch_size, 1, 1, 1).expand(-1, -1, self.n_S, self.n_t)
 
-        x = torch.cat([sigma_f, r_f, K_f, T_f], dim=1)
+        # Log-moneyness encoding
+        K_actual = K_norm * 100.0
+        S_2d = S_grid.view(1, 1, self.n_S, 1).expand(batch_size, -1, -1, self.n_t)
+        log_moneyness = torch.log(S_2d / (K_actual.view(batch_size, 1, 1, 1) + 1e-8) + 1e-8)
+
+        x = torch.cat([sigma_f, r_f, K_f, T_f, log_moneyness], dim=1)
 
         # Lifting
         x = self.lifting(x)  # (batch, width, n_S, n_t)

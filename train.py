@@ -295,12 +295,25 @@ class FNOTrainer:
         pde_loss = torch.tensor(0.0, device=self.device)
         if compute_pde:
             # Only compute PDE on a subset for efficiency (every 3rd batch)
-            residual, _, _, _ = compute_pde_residual_autograd(
+            residual, dV_dS, d2V_dS2, dV_dt = compute_pde_residual_autograd(
                 self.model, sigma, r, K_norm, T_norm,
                 self.S_grid, self.t_grid,
                 self.S_interior, self.t_interior
             )
             pde_loss = torch.mean(residual ** 2)
+
+            # Sobolev Loss: Match AD derivatives with true Delta and Gamma on the interior points
+            if 'Delta' in batch and 'Gamma' in batch:
+                Delta_true = batch['Delta'].to(self.device)
+                Gamma_true = batch['Gamma'].to(self.device)
+                
+                # Interpolate true Delta and Gamma to the interior points
+                Delta_interp = self.model._bilinear_interpolate(Delta_true, self.S_grid, self.t_grid, self.S_interior, self.t_interior)
+                Gamma_interp = self.model._bilinear_interpolate(Gamma_true, self.S_grid, self.t_grid, self.S_interior, self.t_interior)
+                
+                # Scale Sobolev terms (weight them slightly lower than price MSE)
+                sobolev_loss = torch.mean((dV_dS - Delta_interp)**2) + torch.mean((d2V_dS2 - Gamma_interp)**2)
+                data_loss = data_loss + 0.1 * sobolev_loss
 
         return data_loss, pde_loss, V_pred
 
@@ -519,8 +532,15 @@ class FNOTrainer:
             epoch_time = time.time() - t_epoch
 
             # LR schedule
-            self.scheduler.step()
-            lr = self.scheduler.get_last_lr()[0]
+            warmup_epochs = 5
+            base_lr = self.config.learning_rate if hasattr(self.config, 'learning_rate') else 1e-3
+            if epoch < warmup_epochs:
+                lr = 1e-4 + (base_lr - 1e-4) * ((epoch + 1) / warmup_epochs)
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = lr
+            else:
+                self.scheduler.step()
+                lr = self.scheduler.get_last_lr()[0]
 
             # Record
             self.history['train_loss'].append(

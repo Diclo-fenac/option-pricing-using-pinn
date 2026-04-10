@@ -39,8 +39,8 @@ class Config:
     # =============================================================================
     # FNO Architecture
     # =============================================================================
-    fno_modes = 12             # Number of Fourier modes
-    fno_layers = 3             # Number of Fourier layers
+    fno_modes = 24             # Number of Fourier modes
+    fno_layers = 4             # Number of Fourier layers
     fno_width = 64             # Channel width
     fno_nonlinearity = 'gelu'  # Activation function
     

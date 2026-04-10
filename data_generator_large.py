@@ -301,18 +301,15 @@ def generate_full_dataset(n_samples: int,
     start_time = time.perf_counter()
     iterator = tqdm(range(n_batches), desc='Batches', unit='batch') if verbose else range(n_batches)
 
+    # Pre-generate all parameters globally to maintain true LHS distribution
+    global_params = generate_parameters(n_samples, config)
+
     for i in iterator:
         bs = i * batch_size
         be = min((i + 1) * batch_size, n_samples)
         actual = be - bs
 
-        # Sample parameters for this batch (offset seed per batch)
-        config_copy = Config()
-        for k, v in config.__dict__.items():
-            if not k.startswith('__'):
-                setattr(config_copy, k, v)
-        config_copy.seed = config.seed + i * 1000
-        batch_params = generate_parameters(actual, config_copy)
+        batch_params = global_params[bs:be]
 
         results = generate_batch(batch_params, S_grid, t_template)
 
