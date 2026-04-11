@@ -509,35 +509,31 @@ def compute_greeks_autograd(model, sigma, r, K_norm, T_norm,
                              S_grid, t_grid, S_query):
     """
     Compute Delta and Gamma at specified S coordinates via AD.
-
-    Parameters
-    ----------
-    model : FNOOptionPricer
-    sigma, r, K_norm, T_norm : (batch,)
-    S_grid, t_grid : full grids
-    S_query : (n_qS,) S coordinates for Greek computation
-
-    Returns
-    -------
-    delta : (batch, n_qS)
-    gamma : (batch, n_qS)
     """
     batch = sigma.shape[0]
-    n_qS = len(S_query)
-    # Use single time point (middle of grid) for Greeks
+    # Use middle of time grid for Greeks
     t_mid = t_grid[len(t_grid) // 2:len(t_grid) // 2 + 1]
+    
+    # Meshgrid for AD
+    S_mesh, t_mesh = torch.meshgrid(S_query, t_mid, indexing='ij')
+    S_mesh = S_mesh.detach().clone().requires_grad_(True)
 
-    S_q = S_query.detach().clone().requires_grad_(True)
-    t_q = t_mid.detach().clone().requires_grad_(True)
-
-    V = model.query(sigma, r, K_norm, T_norm, S_q, t_q, S_grid, t_grid)
+    V = model.query(sigma, r, K_norm, T_norm, S_mesh, t_mesh, S_grid, t_grid)
 
     dV_dS = torch.autograd.grad(
-        V.sum(), S_q, create_graph=True, retain_graph=True
+        V, S_mesh, grad_outputs=torch.ones_like(V), 
+        create_graph=True, retain_graph=True, allow_unused=True
     )[0]
+    if dV_dS is None: dV_dS = torch.zeros_like(S_mesh)
 
     d2V_dS2 = torch.autograd.grad(
-        dV_dS.sum(), S_q, create_graph=True, retain_graph=True
+        dV_dS, S_mesh, grad_outputs=torch.ones_like(dV_dS), 
+        create_graph=True, retain_graph=True, allow_unused=True
+    )[0]
+    if d2V_dS2 is None: d2V_dS2 = torch.zeros_like(S_mesh)
+
+    return dV_dS.squeeze(-1), d2V_dS2.squeeze(-1)
+raph=True
     )[0]
 
     return dV_dS, d2V_dS2
