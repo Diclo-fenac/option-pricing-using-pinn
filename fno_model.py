@@ -42,14 +42,20 @@ class SpectralConv2d(nn.Module):
         """x: (batch, ch, nx, ny)"""
         b = x.shape[0]
         x_ft = torch.fft.rfft2(x)
-        out_ft = torch.zeros_like(x_ft)
+        nx, ny_half = x.shape[-2], x.shape[-1] // 2 + 1
 
-        # Low-frequency block (top-left)
-        out_ft[:, :, :self.modes1, :self.modes2] = \
-            self._mul(x_ft[:, :, :self.modes1, :self.modes2], self.w1)
-        # Low-frequency block (top-right in complex-conjugate symmetric sense)
-        out_ft[:, :, -self.modes1:, :self.modes2] = \
-            self._mul(x_ft[:, :, -self.modes1:, :self.modes2], self.w2)
+        # Both ops are graph-connected, no in-place writes
+        out1 = self._mul(x_ft[:, :, :self.modes1, :self.modes2], self.w1)
+        out2 = self._mul(x_ft[:, :, -self.modes1:, :self.modes2], self.w2)
+
+        mid_rows = nx - 2 * self.modes1
+        z_mid = torch.zeros(b, self.out_c, mid_rows, self.modes2,
+                            dtype=x_ft.dtype, device=x.device)
+        z_right = torch.zeros(b, self.out_c, nx, ny_half - self.modes2,
+                              dtype=x_ft.dtype, device=x.device)
+
+        left_col = torch.cat([out1, z_mid, out2], dim=2)  # (b, out_c, nx, modes2)
+        out_ft = torch.cat([left_col, z_right], dim=3)    # (b, out_c, nx, ny_half)
 
         return torch.fft.irfft2(out_ft, s=(x.shape[-2], x.shape[-1]))
 
@@ -409,46 +415,30 @@ class FNOOptionPricer(nn.Module):
     @staticmethod
     def _bilinear_interpolate(V, S_grid, t_grid, S_q, t_q):
         """
-        Bilinear interpolation on the (S, t) grid.
+        Bilinear interpolation on the (S, t) grid using F.grid_sample.
+        Fully differentiable in S_q, t_q — supports second-order gradients.
+
         V: (batch, n_S, n_t)
         S_grid: (n_S,), t_grid: (n_t,)
         S_q: (n_qS,), t_q: (n_qt,)
 
         Returns: (batch, n_qS, n_qt)
         """
-        batch, n_S, n_t = V.shape
-        n_qS, n_qt = len(S_q), len(t_q)
+        batch = V.shape[0]
 
-        # Normalize query coordinates to [0, n-1] index space
-        s_idx = (S_q - S_grid[0]) / (S_grid[-1] - S_grid[0] + 1e-8) * (n_S - 1)
-        t_idx = (t_q - t_grid[0]) / (t_grid[-1] - t_grid[0] + 1e-8) * (n_t - 1)
+        # Normalize to [-1, 1] (grid_sample convention)
+        s_norm = 2.0 * (S_q - S_grid[0]) / (S_grid[-1] - S_grid[0] + 1e-8) - 1.0
+        t_norm = 2.0 * (t_q - t_grid[0]) / (t_grid[-1] - t_grid[0] + 1e-8) - 1.0
 
-        s_idx = s_idx.clamp(0, n_S - 2)
-        t_idx = t_idx.clamp(0, n_t - 2)
+        s_mesh, t_mesh = torch.meshgrid(s_norm, t_norm, indexing='ij')
+        # grid_sample expects (N, H_out, W_out, 2): [x=col(t), y=row(S)]
+        grid = torch.stack([t_mesh, s_mesh], dim=-1)          # (n_qS, n_qt, 2)
+        grid = grid.unsqueeze(0).expand(batch, -1, -1, -1)    # (batch, n_qS, n_qt, 2)
 
-        s0 = s_idx.floor().long()
-        s1 = s0 + 1
-        t0 = t_idx.floor().long()
-        t1 = t0 + 1
-
-        # Interpolation weights
-        ws = s_idx - s0.float()  # (n_qS,)
-        wt = t_idx - t0.float()  # (n_qt,)
-
-        # Gather corner values: V[batch, s, t]
-        # Shape: (batch, n_qS, n_qt)
-        c00 = V[torch.arange(batch)[:, None, None], s0[:, None], t0[None, :]]
-        c10 = V[torch.arange(batch)[:, None, None], s1[:, None], t0[None, :]]
-        c01 = V[torch.arange(batch)[:, None, None], s0[:, None], t1[None, :]]
-        c11 = V[torch.arange(batch)[:, None, None], s1[:, None], t1[None, :]]
-
-        # Bilinear interpolation
-        V_q = (c00 * (1 - ws)[:, None] * (1 - wt)[None, :] +
-               c10 * ws[:, None] * (1 - wt)[None, :] +
-               c01 * (1 - ws)[:, None] * wt[None, :] +
-               c11 * ws[:, None] * wt[None, :])
-
-        return V_q
+        V_out = F.grid_sample(V.unsqueeze(1), grid,
+                              mode='bilinear', align_corners=True,
+                              padding_mode='border')
+        return V_out.squeeze(1)   # (batch, n_qS, n_qt)
 
 
 # AD-based PDE Residual & Greeks
@@ -483,22 +473,19 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
     dV_dS = torch.autograd.grad(
         V.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
     )[0]
-    if dV_dS is None:
-        dV_dS = torch.zeros_like(S_q)
+    dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_q).requires_grad_(True)
 
     # ∂²V/∂S²
     d2V_dS2 = torch.autograd.grad(
         dV_dS.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
     )[0]
-    if d2V_dS2 is None:
-        d2V_dS2 = torch.zeros_like(S_q)
+    d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_q).requires_grad_(True)
 
     # ∂V/∂t
     dV_dt = torch.autograd.grad(
         V.sum(), t_q, create_graph=True, retain_graph=True, allow_unused=True
     )[0]
-    if dV_dt is None:
-        dV_dt = torch.zeros_like(t_q)
+    dV_dt = dV_dt if dV_dt is not None else torch.zeros_like(t_q).requires_grad_(True)
 
     # Black-Scholes PDE residual
     S_2d = S_q.view(1, -1, 1)      # (1, n_qS, 1)
@@ -527,19 +514,15 @@ def compute_greeks_autograd(model, sigma, r, K_norm, T_norm,
     V = model.query(sigma, r, K_norm, T_norm, S_mesh, t_mesh, S_grid, t_grid)
 
     dV_dS = torch.autograd.grad(
-        V, S_mesh, grad_outputs=torch.ones_like(V), 
+        V, S_mesh, grad_outputs=torch.ones_like(V),
         create_graph=True, retain_graph=True, allow_unused=True
     )[0]
-    if dV_dS is None: dV_dS = torch.zeros_like(S_mesh)
+    dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_mesh).requires_grad_(True)
 
     d2V_dS2 = torch.autograd.grad(
-        dV_dS, S_mesh, grad_outputs=torch.ones_like(dV_dS), 
+        dV_dS, S_mesh, grad_outputs=torch.ones_like(dV_dS),
         create_graph=True, retain_graph=True, allow_unused=True
     )[0]
-    if d2V_dS2 is None: d2V_dS2 = torch.zeros_like(S_mesh)
+    d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_mesh).requires_grad_(True)
 
     return dV_dS.squeeze(-1), d2V_dS2.squeeze(-1)
-raph=True
-    )[0]
-
-    return dV_dS, d2V_dS2
