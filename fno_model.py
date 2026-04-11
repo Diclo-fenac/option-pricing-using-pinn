@@ -415,8 +415,10 @@ class FNOOptionPricer(nn.Module):
     @staticmethod
     def _bilinear_interpolate(V, S_grid, t_grid, S_q, t_q):
         """
-        Bilinear interpolation on the (S, t) grid using F.grid_sample.
-        Fully differentiable in S_q, t_q — supports second-order gradients.
+        Bilinear interpolation on the (S, t) grid.
+        First-order gradients flow through bilinear weights; second-order
+        gradients flow through the decoder's coordinate-aware MLP (which
+        receives S_q, t_q directly as inputs).
 
         V: (batch, n_S, n_t)
         S_grid: (n_S,), t_grid: (n_t,)
@@ -424,21 +426,39 @@ class FNOOptionPricer(nn.Module):
 
         Returns: (batch, n_qS, n_qt)
         """
-        batch = V.shape[0]
+        batch, n_S, n_t = V.shape
+        n_qS, n_qt = len(S_q), len(t_q)
 
-        # Normalize to [-1, 1] (grid_sample convention)
-        s_norm = 2.0 * (S_q - S_grid[0]) / (S_grid[-1] - S_grid[0] + 1e-8) - 1.0
-        t_norm = 2.0 * (t_q - t_grid[0]) / (t_grid[-1] - t_grid[0] + 1e-8) - 1.0
+        # Normalize query coordinates to [0, n-1] index space
+        s_idx = (S_q - S_grid[0]) / (S_grid[-1] - S_grid[0] + 1e-8) * (n_S - 1)
+        t_idx = (t_q - t_grid[0]) / (t_grid[-1] - t_grid[0] + 1e-8) * (n_t - 1)
 
-        s_mesh, t_mesh = torch.meshgrid(s_norm, t_norm, indexing='ij')
-        # grid_sample expects (N, H_out, W_out, 2): [x=col(t), y=row(S)]
-        grid = torch.stack([t_mesh, s_mesh], dim=-1)          # (n_qS, n_qt, 2)
-        grid = grid.unsqueeze(0).expand(batch, -1, -1, -1)    # (batch, n_qS, n_qt, 2)
+        s_idx = s_idx.clamp(0, n_S - 2)
+        t_idx = t_idx.clamp(0, n_t - 2)
 
-        V_out = F.grid_sample(V.unsqueeze(1), grid,
-                              mode='bilinear', align_corners=True,
-                              padding_mode='border')
-        return V_out.squeeze(1)   # (batch, n_qS, n_qt)
+        s0 = s_idx.floor().long()
+        s1 = s0 + 1
+        t0 = t_idx.floor().long()
+        t1 = t0 + 1
+
+        # Interpolation weights — first-order gradient path through s_idx, t_idx
+        ws = s_idx - s0.float()  # (n_qS,)
+        wt = t_idx - t0.float()  # (n_qt,)
+
+        # Gather corner values: V[batch, s, t]
+        # Shape: (batch, n_qS, n_qt)
+        c00 = V[torch.arange(batch)[:, None, None], s0[:, None], t0[None, :]]
+        c10 = V[torch.arange(batch)[:, None, None], s1[:, None], t0[None, :]]
+        c01 = V[torch.arange(batch)[:, None, None], s0[:, None], t1[None, :]]
+        c11 = V[torch.arange(batch)[:, None, None], s1[:, None], t1[None, :]]
+
+        # Bilinear interpolation
+        V_q = (c00 * (1 - ws)[:, None] * (1 - wt)[None, :] +
+               c10 * ws[:, None] * (1 - wt)[None, :] +
+               c01 * (1 - ws)[:, None] * wt[None, :] +
+               c11 * ws[:, None] * wt[None, :])
+
+        return V_q
 
 
 # AD-based PDE Residual & Greeks
