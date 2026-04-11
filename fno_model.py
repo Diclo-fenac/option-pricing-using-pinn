@@ -508,12 +508,17 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
     dV_dt = dV_dt if dV_dt is not None else torch.zeros_like(t_q).requires_grad_(True)
 
     # Black-Scholes PDE residual
-    S_2d = S_q.view(1, -1, 1)      # (1, n_qS, 1)
+    # Gradients have shapes: dV_dS/d2V_dS2 ~ (n_qS,), dV_dt ~ (n_qt,)
+    # Need to broadcast to (batch, n_qS, n_qt) to match V
+    S_2d = S_q.view(1, -1, 1)           # (1, n_qS, 1)
+    dV_dS_3d = dV_dS.view(1, -1, 1)     # (1, n_qS, 1)
+    d2V_dS2_3d = d2V_dS2.view(1, -1, 1) # (1, n_qS, 1)
+    dV_dt_3d = dV_dt.view(1, 1, -1)     # (1, 1, n_qt)
     sigma_3d = sigma.view(-1, 1, 1)
     r_3d = r.view(-1, 1, 1)
 
-    residual = dV_dt + 0.5 * sigma_3d**2 * S_2d**2 * d2V_dS2 + \
-               r_3d * S_2d * dV_dS - r_3d * V
+    residual = dV_dt_3d + 0.5 * sigma_3d**2 * S_2d**2 * d2V_dS2_3d + \
+               r_3d * S_2d * dV_dS_3d - r_3d * V
 
     return residual, dV_dS, d2V_dS2, dV_dt
 
