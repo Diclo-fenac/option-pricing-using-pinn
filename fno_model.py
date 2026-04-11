@@ -260,7 +260,7 @@ class FNOOptionPricer(nn.Module):
         # --- Lifting network ---
         # Input: broadcast parameters (σ, r, K_norm, T_norm) over grid + Fourier PE
         # Output: (batch, width, n_S, n_t)
-        in_channels = 4  # σ, r, K/S_ref, T
+        in_channels = 6  # σ, r, K/S_ref, T, log(S/K), sqrt(τ)
 
         self.lifting = nn.Sequential(
             nn.Conv2d(in_channels, self.width, 1),
@@ -287,6 +287,11 @@ class FNOOptionPricer(nn.Module):
             hidden_dim=128,
             num_layers=3
         )
+
+    def set_active_modes(self, modes):
+        """Dynamically adjust modes for iFNO strategy."""
+        for block in self.fourier_blocks:
+            block.spec.active_modes = modes
 
     def forward(self, sigma, r, K_norm, T_norm, S_grid, t_grid, return_raw=False):
         """
