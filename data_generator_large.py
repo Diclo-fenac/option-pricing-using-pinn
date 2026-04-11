@@ -179,8 +179,8 @@ def black_scholes_surface(sigma: np.ndarray,
     d1 = np.clip(d1, -37.0, 37.0)
     d2 = np.clip(d2, -37.0, 37.0)
 
-    N_d1 = 0.5 * (1.0 + np.clip(np.erf(d1 / np.sqrt(2.0)), -1.0, 1.0))
-    N_d2 = 0.5 * (1.0 + np.clip(np.erf(d2 / np.sqrt(2.0)), -1.0, 1.0))
+    N_d1 = 0.5 * (1.0 + np.clip(scipy.special.erf(d1 / np.sqrt(2.0)), -1.0, 1.0))
+    N_d2 = 0.5 * (1.0 + np.clip(scipy.special.erf(d2 / np.sqrt(2.0)), -1.0, 1.0))
 
     discount = np.exp(-r_b * tau_b)
 
@@ -211,7 +211,7 @@ def compute_delta(sigma, r, K, T, S_grid, t_template):
     d1 = (ln_SK + (r_b + 0.5 * sig_b**2) * tau_b) / (sig_b * sqrt_tau)
     d1 = np.clip(d1, -37.0, 37.0)
 
-    delta = 0.5 * (1.0 + np.clip(np.erf(d1 / np.sqrt(2.0)), -1.0, 1.0))
+    delta = 0.5 * (1.0 + np.clip(scipy.special.erf(d1 / np.sqrt(2.0)), -1.0, 1.0))
 
     at_expiry = (T[:, np.newaxis, np.newaxis] * (1.0 - t_template[np.newaxis, np.newaxis, :]) <= 1e-8)
     delta_at_expiry = (S > K_b).astype(np.float32)
@@ -430,8 +430,8 @@ def validate_dataset(params, V, S_grid, t_template, n_check=100, seed=123):
         d2 = d1 - sigma * sqrt_tau
         d1, d2 = np.clip(d1, -37, 37), np.clip(d2, -37, 37)
 
-        N_d1 = 0.5 * (1.0 + np.erf(d1 / np.sqrt(2.0)))
-        N_d2 = 0.5 * (1.0 + np.erf(d2 / np.sqrt(2.0)))
+        N_d1 = 0.5 * (1.0 + scipy.special.erf(d1 / np.sqrt(2.0)))
+        N_d2 = 0.5 * (1.0 + scipy.special.erf(d2 / np.sqrt(2.0)))
         V_ref = S * N_d1 - K * np.exp(-r * tau_b) * N_d2
 
         at_expiry = (T - t_grid <= 1e-8)[np.newaxis, :]

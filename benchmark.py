@@ -60,8 +60,8 @@ def _vectorized_bs_price(S_grid, t_grid, sigma, r, K, T, t_template):
     d2 = d1 - sigma * sqrt_tau
     d1, d2 = np.clip(d1, -37, 37), np.clip(d2, -37, 37)
 
-    N_d1 = 0.5 * (1.0 + np.clip(np.erf(d1 / np.sqrt(2.0)), -1.0, 1.0))
-    N_d2 = 0.5 * (1.0 + np.clip(np.erf(d2 / np.sqrt(2.0)), -1.0, 1.0))
+    N_d1 = 0.5 * (1.0 + np.clip(scipy.special.erf(d1 / np.sqrt(2.0)), -1.0, 1.0))
+    N_d2 = 0.5 * (1.0 + np.clip(scipy.special.erf(d2 / np.sqrt(2.0)), -1.0, 1.0))
 
     V = S * N_d1 - K * np.exp(-r * tau_b) * N_d2
 
@@ -82,7 +82,7 @@ def _analytical_greeks(S, K, T, sigma, r):
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
     d1 = np.clip(d1, -37, 37)
 
-    delta = 0.5 * (1.0 + np.erf(d1 / np.sqrt(2.0)))
+    delta = 0.5 * (1.0 + scipy.special.erf(d1 / np.sqrt(2.0)))
     phi = np.exp(-0.5 * d1**2) / np.sqrt(2.0 * np.pi)
     gamma = phi / (S * sigma * sqrt_T)
 
@@ -208,8 +208,8 @@ def benchmark_bs_speed(data, config):
     d1 = (ln_SK + (r_3d + 0.5 * sig_3d**2) * tau_3d) / (sig_3d * sqrt_tau)
     d2 = d1 - sig_3d * sqrt_tau
     d1, d2 = np.clip(d1, -37, 37), np.clip(d2, -37, 37)
-    N_d1 = 0.5 * (1.0 + np.clip(np.erf(d1 / np.sqrt(2.0)), -1.0, 1.0))
-    N_d2 = 0.5 * (1.0 + np.clip(np.erf(d2 / np.sqrt(2.0)), -1.0, 1.0))
+    N_d1 = 0.5 * (1.0 + np.clip(scipy.special.erf(d1 / np.sqrt(2.0)), -1.0, 1.0))
+    N_d2 = 0.5 * (1.0 + np.clip(scipy.special.erf(d2 / np.sqrt(2.0)), -1.0, 1.0))
     discount = np.exp(-r_3d * tau_3d)
     V_batched = (S * N_d1 - K_3d * discount * N_d2).astype(np.float32)
 
