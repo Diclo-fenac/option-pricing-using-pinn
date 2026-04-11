@@ -501,4 +501,3 @@ def generate_data(config: Optional[Config] = None):
 
 if __name__ == '__main__':
     generate_data()
-_data()
