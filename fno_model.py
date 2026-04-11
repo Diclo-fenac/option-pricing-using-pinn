@@ -133,6 +133,39 @@ class CoordinateDecoder(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
+    def evaluate(self, features, S_query, t_query, S_min, S_max, t_min, t_max):
+        """
+        Evaluate at arbitrary coordinates.
+        features: (batch, ..., feature_dim)
+        S_query: (batch, ...) or (...)
+        t_query: (batch, ...) or (...)
+        """
+        # Normalize coordinates using global bounds
+        S_log = torch.log(S_query + 1e-6)
+        S_log_min = math.log(S_min + 1e-6)
+        S_log_max = math.log(S_max + 1e-6)
+        S_norm = (S_log - S_log_min) / (S_log_max - S_log_min + 1e-8)
+        
+        t_norm = (t_query - t_min) / (t_max - t_min + 1e-8)
+
+        # Coordinate stack
+        coords = torch.stack([S_norm, t_norm], dim=-1) # (..., 2)
+        
+        # Fourier embedding
+        coord_emb = self.fourier_embed(coords) # (..., coord_dim)
+        
+        # If coords are not batched, expand them
+        if coord_emb.dim() < features.dim():
+            coord_emb = coord_emb.unsqueeze(0).expand(features.shape[0], *([-1]*(features.dim()-1)))
+
+        # Concatenate features + coordinates
+        x = torch.cat([features, coord_emb], dim=-1)
+
+        # Apply MLP pointwise
+        V = self.mlp(x).squeeze(-1)
+
+        return V
+
     def forward(self, features, S_grid, t_grid):
         """
         Parameters
@@ -146,30 +179,11 @@ class CoordinateDecoder(nn.Module):
         V : (batch, n_S, n_t) — differentiable w.r.t. S_grid and t_grid
         """
         batch, n_S, n_t, feat_dim = features.shape
-
-        # Normalize coordinates to [0, 1] for stable Fourier embedding
-        # Use log-price transform for S to better resolve OTM regions
-        S_log = torch.log(S_grid + 1e-6)
-        S_norm = (S_log - S_log.min()) / (S_log.max() - S_log.min() + 1e-8)
+        S_mesh, t_mesh = torch.meshgrid(S_grid, t_grid, indexing='ij')
         
-        t_norm = (t_grid - t_grid.min()) / (t_grid.max() - t_grid.min() + 1e-8)
-
-        # Coordinate meshgrid
-        S_mesh, t_mesh = torch.meshgrid(S_norm, t_norm, indexing='ij')  # (n_S, n_t)
-        coords = torch.stack([S_mesh, t_mesh], dim=-1)  # (n_S, n_t, 2)
-
-        # Fourier embedding of coordinates
-        coord_emb = self.fourier_embed(coords)  # (n_S, n_t, coord_dim)
-
-        # Broadcast coords across batch
-        coord_emb = coord_emb.unsqueeze(0).expand(batch, -1, -1, -1)  # (batch, n_S, n_t, coord_dim)
-
-        # Concatenate features + coordinates
-        x = torch.cat([features, coord_emb], dim=-1)  # (batch, n_S, n_t, feat_dim + coord_dim)
-
-        # Apply MLP pointwise
-        V = self.mlp(x).squeeze(-1)  # (batch, n_S, n_t)
-
+        V = self.evaluate(features, S_mesh, t_mesh, 
+                          S_grid.min().item(), S_grid.max().item(), 
+                          t_grid.min().item(), t_grid.max().item())
         return V
 
 
@@ -192,41 +206,37 @@ class HardConstrainedOutput(nn.Module):
     """
 
     @staticmethod
-    def forward(V_raw, S_grid, K, t_grid, T):
+    def forward(V_raw, S, K, t, T):
         """
         Parameters
         ----------
-        V_raw  : (batch, n_S, n_t) — unconstrained network output
-        S_grid : (n_S,)
+        V_raw  : (batch, ...) — unconstrained network output
+        S      : (batch, ...) or (...,)
         K      : (batch,)
-        t_grid : (n_t,)
+        t      : (batch, ...) or (...,)
         T      : (batch,)
-
-        Returns
-        -------
-        V : (batch, n_S, n_t)
         """
         device = V_raw.device
-        n_S, n_t = V_raw.shape[1], V_raw.shape[2]
-
-        # τ = T - t  →  (batch, n_t)
-        tau = T[:, None] - t_grid[None, :]  # (batch, n_t)
+        
+        # Expand K and T to match V_raw shape
+        batch_size = V_raw.shape[0]
+        extra_dims = [1] * (V_raw.dim() - 1)
+        K_expanded = K.view(batch_size, *extra_dims)
+        T_expanded = T.view(batch_size, *extra_dims)
+        
+        # τ = T - t
+        tau = T_expanded - t
         tau = tau.clamp(min=0.0)
 
-        # Payoff at expiry: (batch, n_S, 1)
-        S_2d = S_grid.view(1, n_S, 1)        # (1, n_S, 1)
-        K_3d = K.view(-1, 1, 1)               # (batch, 1, 1)
-        payoff = torch.maximum(S_2d - K_3d, torch.tensor(0.0, device=device))
+        # Payoff at expiry
+        payoff = torch.maximum(S - K_expanded, torch.tensor(0.0, device=device))
 
         # Modulation factor that vanishes at τ=0 and S=0
-        # τ: (batch, 1, n_t)
-        tau_3d = tau[:, None, :]
-        # S/(S+K): (1, n_S, 1)
-        S_mod = S_2d / (S_2d + K_3d + 1e-8)
+        S_mod = S / (S + K_expanded + 1e-8)
         # Sigmoid envelope for smoothness
-        sigmoid_tau = torch.sigmoid(5.0 * tau_3d)
+        sigmoid_tau = torch.sigmoid(5.0 * tau)
 
-        modulation = tau_3d * S_mod * sigmoid_tau  # (batch, n_S, n_t)
+        modulation = tau * S_mod * sigmoid_tau
 
         # Hard-constrained output
         V = payoff + V_raw * modulation
@@ -295,28 +305,12 @@ class FNOOptionPricer(nn.Module):
 
     def forward(self, sigma, r, K_norm, T_norm, S_grid, t_grid, return_raw=False):
         """
-        Forward pass with hard-constrained output.
-
-        Parameters
-        ----------
-        sigma    : (batch,) volatility
-        r        : (batch,) risk-free rate
-        K_norm   : (batch,) normalized strike (K / S_ref)
-        T_norm   : (batch,) normalized maturity (T / T_max)
-        S_grid   : (n_S,) asset price grid
-        t_grid   : (n_t,) time grid
-        return_raw : bool — if True, also return unconstrained V̂_raw
-
-        Returns
-        -------
-        V : (batch, n_S, n_t) — hard-constrained pricing surface
-        V_raw : (batch, n_S, n_t) — only if return_raw=True
+        Forward pass with hard-constrained output on the grid.
         """
         device = sigma.device
         batch_size = sigma.shape[0]
 
         # Broadcast parameters over spatial grid
-        # (batch, 4, n_S, n_t)
         sigma_f = sigma.view(batch_size, 1, 1, 1).expand(-1, -1, self.n_S, self.n_t)
         r_f = r.view(batch_size, 1, 1, 1).expand(-1, -1, self.n_S, self.n_t)
         K_f = K_norm.view(batch_size, 1, 1, 1).expand(-1, -1, self.n_S, self.n_t)
@@ -330,8 +324,8 @@ class FNOOptionPricer(nn.Module):
         # sqrt(tau) encoding
         T_actual = T_norm * 2.0
         t_abs = t_grid.view(1, 1, 1, self.n_t)
-        tau = torch.maximum(T_actual.view(batch_size, 1, 1, 1) - t_abs, torch.tensor(1e-8, device=device))
-        sqrt_tau = torch.sqrt(tau).expand(batch_size, -1, self.n_S, -1)
+        tau_grid = torch.maximum(T_actual.view(batch_size, 1, 1, 1) - t_abs, torch.tensor(1e-8, device=device))
+        sqrt_tau = torch.sqrt(tau_grid).expand(batch_size, -1, self.n_S, -1)
 
         x = torch.cat([sigma_f, r_f, K_f, T_f, log_moneyness, sqrt_tau], dim=1)
 
@@ -352,9 +346,8 @@ class FNOOptionPricer(nn.Module):
         V_raw = self.decoder(features, S_grid, t_grid)  # (batch, n_S, n_t)
 
         # Hard-constrained boundary condition
-        K_actual = K_norm * 100.0  # Assuming S_ref = 100
-        T_actual = T_norm * 2.0    # Assuming T_max = 2.0
-        V = HardConstrainedOutput.forward(V_raw, S_grid, K_actual, t_grid, T_actual)
+        S_mesh, t_mesh = torch.meshgrid(S_grid, t_grid, indexing='ij')
+        V = HardConstrainedOutput.forward(V_raw, S_mesh, K_actual, t_mesh, T_actual)
 
         if return_raw:
             return V, V_raw
@@ -363,26 +356,54 @@ class FNOOptionPricer(nn.Module):
     def query(self, sigma, r, K_norm, T_norm, S_query, t_query, S_grid, t_grid):
         """
         Query the model at arbitrary (S, t) coordinates (differentiable).
-
-        This enables AD-based PDE residual and Greek computation at
-        any point, not just grid nodes.
-
-        Parameters
-        ----------
-        sigma, r, K_norm, T_norm : (batch,)
-        S_query : (n_qS,) query S coordinates
-        t_query : (n_qt,) query t coordinates
-        S_grid, t_grid : full grids for FNO backbone
-
-        Returns
-        -------
-        V : (batch, n_qS, n_qt)
         """
-        # Get full-surface prediction
-        V_full = self.forward(sigma, r, K_norm, T_norm, S_grid, t_grid)
+        device = sigma.device
+        batch_size = sigma.shape[0]
 
-        # Bilinear interpolation to query points
-        V = self._bilinear_interpolate(V_full, S_grid, t_grid, S_query, t_query)
+        # 1. Get features from FNO backbone on the base grid
+        sigma_f = sigma.view(batch_size, 1, 1, 1).expand(-1, -1, self.n_S, self.n_t)
+        r_f = r.view(batch_size, 1, 1, 1).expand(-1, -1, self.n_S, self.n_t)
+        K_f = K_norm.view(batch_size, 1, 1, 1).expand(-1, -1, self.n_S, self.n_t)
+        T_f = T_norm.view(batch_size, 1, 1, 1).expand(-1, -1, self.n_S, self.n_t)
+
+        K_actual = K_norm * 100.0
+        S_2d = S_grid.view(1, 1, self.n_S, 1).expand(batch_size, -1, -1, self.n_t)
+        log_moneyness = torch.log(S_2d / (K_actual.view(batch_size, 1, 1, 1) + 1e-8) + 1e-8)
+
+        T_actual = T_norm * 2.0
+        t_abs_grid = t_grid.view(1, 1, 1, self.n_t)
+        tau_grid = torch.maximum(T_actual.view(batch_size, 1, 1, 1) - t_abs_grid, torch.tensor(1e-8, device=device))
+        sqrt_tau = torch.sqrt(tau_grid).expand(batch_size, -1, self.n_S, -1)
+
+        x = torch.cat([sigma_f, r_f, K_f, T_f, log_moneyness, sqrt_tau], dim=1)
+        x = self.lifting(x)
+        for block in self.fourier_blocks:
+            x = F.gelu(block(x))
+        features = self.feature_proj(x) # (batch, width, n_S, n_t)
+
+        # 2. Interpolate grid features to query meshgrid
+        # S_query: (n_qS,), t_query: (n_qt,)
+        S_mesh_q, t_mesh_q = torch.meshgrid(S_query, t_query, indexing='ij')
+        
+        # Bilinear interpolation of features
+        # features: (batch, width, n_S, n_t)
+        # _bilinear_interpolate expect V: (batch, n_S, n_t)
+        # We'll apply it per feature channel
+        feat_list = []
+        for i in range(self.width):
+            f_chan = self._bilinear_interpolate(features[:, i, :, :], S_grid, t_grid, S_query, t_query)
+            feat_list.append(f_chan.unsqueeze(-1))
+        
+        feat_interp = torch.cat(feat_list, dim=-1) # (batch, n_qS, n_qt, width)
+
+        # 3. Evaluate Decoder MLP directly on query coordinates
+        V_raw = self.decoder.evaluate(feat_interp, S_mesh_q, t_mesh_q,
+                                      S_grid.min().item(), S_grid.max().item(),
+                                      t_grid.min().item(), t_grid.max().item())
+
+        # 4. Apply Hard Constraints directly on query coordinates
+        V = HardConstrainedOutput.forward(V_raw, S_mesh_q, K_actual, t_mesh_q, T_actual)
+
         return V
 
     @staticmethod
