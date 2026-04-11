@@ -481,18 +481,24 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
 
     # ∂V/∂S
     dV_dS = torch.autograd.grad(
-        V.sum(), S_q, create_graph=True, retain_graph=True
+        V.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
     )[0]
+    if dV_dS is None:
+        dV_dS = torch.zeros_like(S_q)
 
     # ∂²V/∂S²
     d2V_dS2 = torch.autograd.grad(
-        dV_dS.sum(), S_q, create_graph=True, retain_graph=True
+        dV_dS.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
     )[0]
+    if d2V_dS2 is None:
+        d2V_dS2 = torch.zeros_like(S_q)
 
     # ∂V/∂t
     dV_dt = torch.autograd.grad(
-        V.sum(), t_q, create_graph=True, retain_graph=True
+        V.sum(), t_q, create_graph=True, retain_graph=True, allow_unused=True
     )[0]
+    if dV_dt is None:
+        dV_dt = torch.zeros_like(t_q)
 
     # Black-Scholes PDE residual
     S_2d = S_q.view(1, -1, 1)      # (1, n_qS, 1)
