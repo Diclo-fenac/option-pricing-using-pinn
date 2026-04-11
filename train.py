@@ -378,10 +378,16 @@ class FNOTrainer:
         """Validation: RMSE + Greeks accuracy."""
         self.model.eval()
         total_rmse = 0.0
+        total_rel_l2 = 0.0
         total_delta_rmse = 0.0
         total_gamma_rmse = 0.0
         total_data_loss = 0.0
         total_pde_loss = 0.0
+        
+        # Subset tracking
+        rel_l2_itm, rel_l2_atm, rel_l2_otm = 0.0, 0.0, 0.0
+        n_itm, n_atm, n_otm = 0, 0, 0
+        
         n_batches = 0
         n_samples = 0
 
@@ -401,6 +407,35 @@ class FNOTrainer:
 
                 rmse = torch.sqrt(torch.mean((V_pred - V_true) ** 2))
                 total_rmse += rmse.item() * len(sigma)
+                
+                # Relative L2 Error
+                batch_rel_l2 = torch.sqrt(torch.mean((V_pred - V_true) ** 2, dim=(1, 2))) / (
+                    torch.sqrt(torch.mean(V_true ** 2, dim=(1, 2))) + 1e-12
+                )
+                total_rel_l2 += torch.sum(batch_rel_l2).item()
+                
+                # Subset categorization
+                # Use S=100 as reference for ATM/ITM/OTM splits based on strike K
+                moneyness = 100.0 / K
+                
+                # OTM: S/K < 0.95 (call) -> moneyness < 0.95
+                otm_mask = moneyness < 0.95
+                if otm_mask.sum() > 0:
+                    rel_l2_otm += torch.sum(batch_rel_l2[otm_mask]).item()
+                    n_otm += otm_mask.sum().item()
+                    
+                # ATM: 0.95 <= S/K <= 1.05
+                atm_mask = (moneyness >= 0.95) & (moneyness <= 1.05)
+                if atm_mask.sum() > 0:
+                    rel_l2_atm += torch.sum(batch_rel_l2[atm_mask]).item()
+                    n_atm += atm_mask.sum().item()
+                    
+                # ITM: S/K > 1.05
+                itm_mask = moneyness > 1.05
+                if itm_mask.sum() > 0:
+                    rel_l2_itm += torch.sum(batch_rel_l2[itm_mask]).item()
+                    n_itm += itm_mask.sum().item()
+
                 total_data_loss += data_loss.item() * len(sigma)
                 total_pde_loss += pde_loss.item() * len(sigma)
 
@@ -447,6 +482,11 @@ class FNOTrainer:
                 n_samples += len(sigma)
 
         total_rmse /= max(n_samples, 1)
+        total_rel_l2 /= max(n_samples, 1)
+        rel_l2_itm = rel_l2_itm / max(n_itm, 1) if n_itm > 0 else 0.0
+        rel_l2_atm = rel_l2_atm / max(n_atm, 1) if n_atm > 0 else 0.0
+        rel_l2_otm = rel_l2_otm / max(n_otm, 1) if n_otm > 0 else 0.0
+        
         total_delta_rmse /= max(n_samples, 1)
         total_gamma_rmse /= max(n_samples, 1)
 
@@ -456,6 +496,10 @@ class FNOTrainer:
 
         return {
             'rmse': total_rmse,
+            'rel_l2': total_rel_l2,
+            'rel_l2_itm': rel_l2_itm,
+            'rel_l2_atm': rel_l2_atm,
+            'rel_l2_otm': rel_l2_otm,
             'delta_rmse': total_delta_rmse,
             'gamma_rmse': total_gamma_rmse,
             'val_data_loss': avg_data_loss,

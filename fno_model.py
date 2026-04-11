@@ -322,7 +322,13 @@ class FNOOptionPricer(nn.Module):
         S_2d = S_grid.view(1, 1, self.n_S, 1).expand(batch_size, -1, -1, self.n_t)
         log_moneyness = torch.log(S_2d / (K_actual.view(batch_size, 1, 1, 1) + 1e-8) + 1e-8)
 
-        x = torch.cat([sigma_f, r_f, K_f, T_f, log_moneyness], dim=1)
+        # sqrt(tau) encoding
+        T_actual = T_norm * 2.0
+        t_abs = t_grid.view(1, 1, 1, self.n_t)
+        tau = torch.maximum(T_actual.view(batch_size, 1, 1, 1) - t_abs, torch.tensor(1e-8, device=device))
+        sqrt_tau = torch.sqrt(tau).expand(batch_size, -1, self.n_S, -1)
+
+        x = torch.cat([sigma_f, r_f, K_f, T_f, log_moneyness, sqrt_tau], dim=1)
 
         # Lifting
         x = self.lifting(x)  # (batch, width, n_S, n_t)

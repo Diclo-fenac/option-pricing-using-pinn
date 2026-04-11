@@ -318,6 +318,12 @@ def generate_full_dataset(n_samples: int,
         Delta[bs:be] = results['Delta']
         Gamma[bs:be] = results['Gamma']
 
+    # Clip Gamma at 99.9th percentile to prevent exploding gradients near zero S and tau
+    gamma_999 = np.percentile(Gamma, 99.9)
+    Gamma = np.clip(Gamma, a_min=None, a_max=gamma_999)
+    if verbose:
+        print(f"Clipped Gamma at 99.9th percentile: {gamma_999:.4f}")
+
     elapsed = time.perf_counter() - start_time
     if verbose:
         print(f"\nDone: {elapsed:.1f}s ({elapsed/n_samples*1e6:.0f}μs/sample, {n_samples/elapsed:.0f} samp/s)")
