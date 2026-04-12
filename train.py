@@ -303,19 +303,22 @@ class FNOTrainer:
             pde_loss = torch.mean(residual ** 2)
 
             # Sobolev Loss: Match AD derivatives with true Delta and Gamma on the interior points
-            if 'Delta' in batch and 'Gamma' in batch:
-                Delta_true = batch['Delta'].to(self.device)
-                Gamma_true = batch['Gamma'].to(self.device)
-                
-                # Interpolate true Delta and Gamma to the interior points
-                Delta_interp = self.model._bilinear_interpolate(Delta_true, self.S_grid, self.t_grid, self.S_interior, self.t_interior)
-                Gamma_interp = self.model._bilinear_interpolate(Gamma_true, self.S_grid, self.t_grid, self.S_interior, self.t_interior)
-                
-                # Scale Sobolev terms (weight them as recommended: 0.5 for Delta, 0.1 for Gamma)
-                delta_mse = torch.mean((dV_dS - Delta_interp)**2)
-                gamma_mse = torch.mean((d2V_dS2 - Gamma_interp)**2)
-                sobolev_loss = 0.5 * delta_mse + 0.1 * gamma_mse
-                data_loss = data_loss + sobolev_loss
+            # DISABLED: The current AD setup computes global gradients (summed over batch/time),
+            # which doesn't match the per-batch-element structure needed for proper Sobolev training.
+            # The PDE residual already enforces correct derivative relationships.
+            # if 'Delta' in batch and 'Gamma' in batch:
+            #     Delta_true = batch['Delta'].to(self.device)
+            #     Gamma_true = batch['Gamma'].to(self.device)
+            #
+            #     # Interpolate true Delta and Gamma to the interior points
+            #     Delta_interp = self.model._bilinear_interpolate(Delta_true, self.S_grid, self.t_grid, self.S_interior, self.t_interior)
+            #     Gamma_interp = self.model._bilinear_interpolate(Gamma_true, self.S_grid, self.t_grid, self.S_interior, self.t_interior)
+            #
+            #     # Scale Sobolev terms (weight them as recommended: 0.5 for Delta, 0.1 for Gamma)
+            #     delta_mse = torch.mean((dV_dS - Delta_interp)**2)
+            #     gamma_mse = torch.mean((d2V_dS2 - Gamma_interp)**2)
+            #     sobolev_loss = 0.5 * delta_mse + 0.1 * gamma_mse
+            #     data_loss = data_loss + sobolev_loss
 
         return data_loss, pde_loss, V_pred
 
