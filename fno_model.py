@@ -482,45 +482,46 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
     residual : (batch, n_qS, n_qt) — should be ≈ 0
     dV_dS, d2V_dS2, dV_dt : Greeks for debugging
     """
-    # Enable gradients for query coordinates
-    S_q = S_interp.detach().clone().requires_grad_(True)
-    t_q = t_interp.detach().clone().requires_grad_(True)
+    with torch.enable_grad():
+        # Enable gradients for query coordinates
+        S_q = S_interp.detach().clone().requires_grad_(True)
+        t_q = t_interp.detach().clone().requires_grad_(True)
+    
+        # Forward through model
+        V = model.query(sigma, r, K_norm, T_norm, S_q, t_q, S_grid, t_grid)
+    
+        # ∂V/∂S
+        dV_dS = torch.autograd.grad(
+            V.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
+        )[0]
+        dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_q).requires_grad_(True)
+    
+        # ∂²V/∂S²
+        d2V_dS2 = torch.autograd.grad(
+            dV_dS.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
+        )[0]
+        d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_q).requires_grad_(True)
+    
+        # ∂V/∂t
+        dV_dt = torch.autograd.grad(
+            V.sum(), t_q, create_graph=True, retain_graph=True, allow_unused=True
+        )[0]
+        dV_dt = dV_dt if dV_dt is not None else torch.zeros_like(t_q).requires_grad_(True)
+    
+        # Black-Scholes PDE residual
+        # Gradients have shapes: dV_dS/d2V_dS2 ~ (n_qS,), dV_dt ~ (n_qt,)
+        # Need to broadcast to (batch, n_qS, n_qt) to match V
+        S_2d = S_q.view(1, -1, 1)           # (1, n_qS, 1)
+        dV_dS_3d = dV_dS.view(1, -1, 1)     # (1, n_qS, 1)
+        d2V_dS2_3d = d2V_dS2.view(1, -1, 1) # (1, n_qS, 1)
+        dV_dt_3d = dV_dt.view(1, 1, -1)     # (1, 1, n_qt)
+        sigma_3d = sigma.view(-1, 1, 1)
+        r_3d = r.view(-1, 1, 1)
+    
+        residual = dV_dt_3d + 0.5 * sigma_3d**2 * S_2d**2 * d2V_dS2_3d + \
+                   r_3d * S_2d * dV_dS_3d - r_3d * V
 
-    # Forward through model
-    V = model.query(sigma, r, K_norm, T_norm, S_q, t_q, S_grid, t_grid)
-
-    # ∂V/∂S
-    dV_dS = torch.autograd.grad(
-        V.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
-    )[0]
-    dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_q).requires_grad_(True)
-
-    # ∂²V/∂S²
-    d2V_dS2 = torch.autograd.grad(
-        dV_dS.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
-    )[0]
-    d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_q).requires_grad_(True)
-
-    # ∂V/∂t
-    dV_dt = torch.autograd.grad(
-        V.sum(), t_q, create_graph=True, retain_graph=True, allow_unused=True
-    )[0]
-    dV_dt = dV_dt if dV_dt is not None else torch.zeros_like(t_q).requires_grad_(True)
-
-    # Black-Scholes PDE residual
-    # Gradients have shapes: dV_dS/d2V_dS2 ~ (n_qS,), dV_dt ~ (n_qt,)
-    # Need to broadcast to (batch, n_qS, n_qt) to match V
-    S_2d = S_q.view(1, -1, 1)           # (1, n_qS, 1)
-    dV_dS_3d = dV_dS.view(1, -1, 1)     # (1, n_qS, 1)
-    d2V_dS2_3d = d2V_dS2.view(1, -1, 1) # (1, n_qS, 1)
-    dV_dt_3d = dV_dt.view(1, 1, -1)     # (1, 1, n_qt)
-    sigma_3d = sigma.view(-1, 1, 1)
-    r_3d = r.view(-1, 1, 1)
-
-    residual = dV_dt_3d + 0.5 * sigma_3d**2 * S_2d**2 * d2V_dS2_3d + \
-               r_3d * S_2d * dV_dS_3d - r_3d * V
-
-    return residual, dV_dS, d2V_dS2, dV_dt
+        return residual, dV_dS, d2V_dS2, dV_dt
 
 
 def compute_greeks_autograd(model, sigma, r, K_norm, T_norm,
@@ -528,26 +529,27 @@ def compute_greeks_autograd(model, sigma, r, K_norm, T_norm,
     """
     Compute Delta and Gamma at specified S coordinates via AD.
     """
-    batch = sigma.shape[0]
-    # Use middle of time grid for Greeks
-    t_mid = t_grid[len(t_grid) // 2:len(t_grid) // 2 + 1]
+    with torch.enable_grad():
+        batch = sigma.shape[0]
+        # Use middle of time grid for Greeks
+        t_mid = t_grid[len(t_grid) // 2:len(t_grid) // 2 + 1]
+        
+        # Meshgrid for AD
+        S_mesh, t_mesh = torch.meshgrid(S_query, t_mid, indexing='ij')
+        S_mesh = S_mesh.detach().clone().requires_grad_(True)
     
-    # Meshgrid for AD
-    S_mesh, t_mesh = torch.meshgrid(S_query, t_mid, indexing='ij')
-    S_mesh = S_mesh.detach().clone().requires_grad_(True)
-
-    V = model.query(sigma, r, K_norm, T_norm, S_mesh, t_mesh, S_grid, t_grid)
-
-    dV_dS = torch.autograd.grad(
-        V, S_mesh, grad_outputs=torch.ones_like(V),
-        create_graph=True, retain_graph=True, allow_unused=True
-    )[0]
-    dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_mesh).requires_grad_(True)
-
-    d2V_dS2 = torch.autograd.grad(
-        dV_dS, S_mesh, grad_outputs=torch.ones_like(dV_dS),
-        create_graph=True, retain_graph=True, allow_unused=True
-    )[0]
-    d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_mesh).requires_grad_(True)
-
-    return dV_dS.squeeze(-1), d2V_dS2.squeeze(-1)
+        V = model.query(sigma, r, K_norm, T_norm, S_mesh, t_mesh, S_grid, t_grid)
+    
+        dV_dS = torch.autograd.grad(
+            V, S_mesh, grad_outputs=torch.ones_like(V),
+            create_graph=True, retain_graph=True, allow_unused=True
+        )[0]
+        dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_mesh).requires_grad_(True)
+    
+        d2V_dS2 = torch.autograd.grad(
+            dV_dS, S_mesh, grad_outputs=torch.ones_like(dV_dS),
+            create_graph=True, retain_graph=True, allow_unused=True
+        )[0]
+        d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_mesh).requires_grad_(True)
+    
+        return dV_dS.squeeze(-1), d2V_dS2.squeeze(-1)

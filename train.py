@@ -449,20 +449,21 @@ class FNOTrainer:
                     Delta_true = batch['Delta'].to(self.device)
                     Gamma_true = batch['Gamma'].to(self.device)
 
-                    # Compute Greeks via AD
-                    # Use middle of S grid and middle of time grid
-                    S_ref = self.S_grid[self.n_S // 2:self.n_S // 2 + 1]
-                    t_ref = self.t_grid[self.n_t // 2:self.n_t // 2 + 1]
-
-                    S_q = S_ref.detach().clone().requires_grad_(True)
-                    t_q = t_ref.detach().clone().requires_grad_(True)
-
-                    V_q = self.model.query(sigma, r, K_norm, T_norm, S_q, t_q,
-                                           self.S_grid, self.t_grid)
-
-                    # AD derivatives
-                    dV_dS = torch.autograd.grad(V_q.sum(), S_q, create_graph=True)[0]
-                    d2V_dS2 = torch.autograd.grad(dV_dS.sum(), S_q, create_graph=True)[0]
+                    with torch.enable_grad():
+                        # Compute Greeks via AD
+                        # Use middle of S grid and middle of time grid
+                        S_ref = self.S_grid[self.n_S // 2:self.n_S // 2 + 1]
+                        t_ref = self.t_grid[self.n_t // 2:self.n_t // 2 + 1]
+    
+                        S_q = S_ref.detach().clone().requires_grad_(True)
+                        t_q = t_ref.detach().clone().requires_grad_(True)
+    
+                        V_q = self.model.query(sigma, r, K_norm, T_norm, S_q, t_q,
+                                               self.S_grid, self.t_grid)
+    
+                        # AD derivatives
+                        dV_dS = torch.autograd.grad(V_q.sum(), S_q, create_graph=True, retain_graph=True)[0]
+                        d2V_dS2 = torch.autograd.grad(dV_dS.sum(), S_q, create_graph=False)[0]
 
                     # Extract at reference point (middle of S grid, middle of time grid)
                     Delta_pred = dV_dS  # (batch, 1, 1)
