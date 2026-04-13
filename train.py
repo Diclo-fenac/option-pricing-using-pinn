@@ -452,8 +452,10 @@ class FNOTrainer:
                     with torch.enable_grad():
                         # Compute Greeks via AD
                         # Use middle of S grid and middle of time grid
-                        S_ref = self.S_grid[self.n_S // 2:self.n_S // 2 + 1]
-                        t_ref = self.t_grid[self.n_t // 2:self.n_t // 2 + 1]
+                        n_S = len(self.S_grid)
+                        n_t = len(self.t_grid)
+                        S_ref = self.S_grid[n_S // 2:n_S // 2 + 1]
+                        t_ref = self.t_grid[n_t // 2:n_t // 2 + 1]
     
                         S_q = S_ref.detach().clone().requires_grad_(True)
                         t_q = t_ref.detach().clone().requires_grad_(True)
@@ -471,8 +473,8 @@ class FNOTrainer:
 
                     # True Greeks at same point (middle S, middle t)
                     # Delta_true: (batch, n_S, n_t) → extract middle
-                    Delta_true_ref = Delta_true[:, self.n_S // 2, self.n_t // 2]
-                    Gamma_true_ref = Gamma_true[:, self.n_S // 2, self.n_t // 2]
+                    Delta_true_ref = Delta_true[:, n_S // 2, n_t // 2]
+                    Gamma_true_ref = Gamma_true[:, n_S // 2, n_t // 2]
 
                     delta_rmse = torch.sqrt(torch.mean(
                         (Delta_pred.squeeze() - Delta_true_ref) ** 2
