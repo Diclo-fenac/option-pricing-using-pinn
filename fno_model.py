@@ -391,25 +391,9 @@ class FNOOptionPricer(nn.Module):
             S_mesh_q = S_query.unsqueeze(2).expand(-1, -1, t_query.shape[1])
             t_mesh_q = t_query.unsqueeze(1).expand(-1, S_query.shape[1], -1)
         
-        # Bilinear interpolation of features using F.grid_sample
+        # Bilinear interpolation of features using custom vectorized implementation
         # features: (batch, width, n_S, n_t)
-        # We need grid in [-1, 1] for grid_sample. H=n_S, W=n_t.
-        # grid[..., 0] is x (t dimension), grid[..., 1] is y (S dimension)
-        S_min, S_max = S_grid[0], S_grid[-1]
-        t_min, t_max = t_grid[0], t_grid[-1]
-        
-        S_norm = (S_mesh_q - S_min) / (S_max - S_min + 1e-8) * 2.0 - 1.0
-        t_norm = (t_mesh_q - t_min) / (t_max - t_min + 1e-8) * 2.0 - 1.0
-        
-        # grid shape: (batch, n_qS, n_qt, 2)
-        grid = torch.stack((t_norm, S_norm), dim=-1)
-        if grid.dim() == 3:
-            # Expand to batch dimension
-            grid = grid.unsqueeze(0).expand(batch_size, -1, -1, -1)
-            
-        feat_interp = F.grid_sample(features, grid, mode='bilinear', align_corners=True)
-        # feat_interp: (batch, width, n_qS, n_qt) -> (batch, n_qS, n_qt, width)
-        feat_interp = feat_interp.permute(0, 2, 3, 1)
+        feat_interp = self._bilinear_interpolate(features, S_grid, t_grid, S_query, t_query)
 
         # 3. Evaluate Decoder MLP directly on query coordinates
         V_raw = self.decoder.evaluate(feat_interp, S_mesh_q, t_mesh_q,
@@ -429,13 +413,13 @@ class FNOOptionPricer(nn.Module):
         gradients flow through the decoder's coordinate-aware MLP (which
         receives S_q, t_q directly as inputs).
 
-        V: (batch, n_S, n_t)
+        V: (batch, width, n_S, n_t)
         S_grid: (n_S,), t_grid: (n_t,)
         S_q: (n_qS,) or (batch, n_qS), t_q: (n_qt,) or (batch, n_qt)
 
-        Returns: (batch, n_qS, n_qt)
+        Returns: (batch, n_qS, n_qt, width)
         """
-        batch, n_S, n_t = V.shape
+        batch, width, n_S, n_t = V.shape
 
         if S_q.dim() == 1:
             n_qS, n_qt = S_q.shape[0], t_q.shape[0]
@@ -456,17 +440,18 @@ class FNOOptionPricer(nn.Module):
             ws = s_idx - s0.float()  # (n_qS,)
             wt = t_idx - t0.float()  # (n_qt,)
     
-            b_idx = torch.arange(batch, device=V.device)[:, None, None]
-            c00 = V[b_idx, s0[:, None], t0[None, :]]
-            c10 = V[b_idx, s1[:, None], t0[None, :]]
-            c01 = V[b_idx, s0[:, None], t1[None, :]]
-            c11 = V[b_idx, s1[:, None], t1[None, :]]
+            b_idx = torch.arange(batch, device=V.device)[:, None, None, None]
+            w_idx = torch.arange(width, device=V.device)[None, :, None, None]
+            c00 = V[b_idx, w_idx, s0[None, None, :, None], t0[None, None, None, :]]
+            c10 = V[b_idx, w_idx, s1[None, None, :, None], t0[None, None, None, :]]
+            c01 = V[b_idx, w_idx, s0[None, None, :, None], t1[None, None, None, :]]
+            c11 = V[b_idx, w_idx, s1[None, None, :, None], t1[None, None, None, :]]
     
             # Bilinear interpolation
-            V_q = (c00 * (1 - ws)[:, None] * (1 - wt)[None, :] +
-                   c10 * ws[:, None] * (1 - wt)[None, :] +
-                   c01 * (1 - ws)[:, None] * wt[None, :] +
-                   c11 * ws[:, None] * wt[None, :])
+            V_q = (c00 * (1 - ws)[None, None, :, None] * (1 - wt)[None, None, None, :] +
+                   c10 * ws[None, None, :, None] * (1 - wt)[None, None, None, :] +
+                   c01 * (1 - ws)[None, None, :, None] * wt[None, None, None, :] +
+                   c11 * ws[None, None, :, None] * wt[None, None, None, :])
         else:
             n_qS, n_qt = S_q.shape[1], t_q.shape[1]
     
@@ -484,18 +469,19 @@ class FNOOptionPricer(nn.Module):
             ws = s_idx - s0.float()  # (batch, n_qS)
             wt = t_idx - t0.float()  # (batch, n_qt)
     
-            b_idx = torch.arange(batch, device=V.device)[:, None, None]
-            c00 = V[b_idx, s0.unsqueeze(2), t0.unsqueeze(1)]
-            c10 = V[b_idx, s1.unsqueeze(2), t0.unsqueeze(1)]
-            c01 = V[b_idx, s0.unsqueeze(2), t1.unsqueeze(1)]
-            c11 = V[b_idx, s1.unsqueeze(2), t1.unsqueeze(1)]
+            b_idx = torch.arange(batch, device=V.device)[:, None, None, None]
+            w_idx = torch.arange(width, device=V.device)[None, :, None, None]
+            c00 = V[b_idx, w_idx, s0[:, None, :, None], t0[:, None, None, :]]
+            c10 = V[b_idx, w_idx, s1[:, None, :, None], t0[:, None, None, :]]
+            c01 = V[b_idx, w_idx, s0[:, None, :, None], t1[:, None, None, :]]
+            c11 = V[b_idx, w_idx, s1[:, None, :, None], t1[:, None, None, :]]
     
-            V_q = (c00 * (1 - ws).unsqueeze(2) * (1 - wt).unsqueeze(1) +
-                   c10 * ws.unsqueeze(2) * (1 - wt).unsqueeze(1) +
-                   c01 * (1 - ws).unsqueeze(2) * wt.unsqueeze(1) +
-                   c11 * ws.unsqueeze(2) * wt.unsqueeze(1))
+            V_q = (c00 * (1 - ws)[:, None, :, None] * (1 - wt)[:, None, None, :] +
+                   c10 * ws[:, None, :, None] * (1 - wt)[:, None, None, :] +
+                   c01 * (1 - ws)[:, None, :, None] * wt[:, None, None, :] +
+                   c11 * ws[:, None, :, None] * wt[:, None, None, :])
 
-        return V_q
+        return V_q.permute(0, 2, 3, 1)
 
 
 # AD-based PDE Residual & Greeks
