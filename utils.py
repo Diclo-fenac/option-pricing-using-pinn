@@ -242,10 +242,8 @@ def upload_to_gcp_bucket(local_file_path, bucket_name, destination_blob_name, se
             print(f"Uploading {local_file_path} to gs://{bucket_name}/{temp_blob_name} (temp) ...")
             temp_blob.upload_from_filename(local_file_path)
 
-            # Rename to final name
-            final_blob = bucket.blob(destination_blob_name)
-            bucket.copy_blob(temp_blob, bucket, final_blob)
-            temp_blob.delete()
+            # Rename to final name using blob.rename (safer than copy_blob for binary)
+            temp_blob.rename(destination_blob_name)
             print(f"✓ Upload complete: gs://{bucket_name}/{destination_blob_name}")
         else:
             blob = bucket.blob(destination_blob_name)
