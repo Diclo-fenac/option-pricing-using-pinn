@@ -489,9 +489,14 @@ class FNOOptionPricer(nn.Module):
 def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
                                    S_grid, t_grid, S_interp, t_interp):
     """
-    Compute Black-Scholes PDE residual using Automatic Differentiation.
+    Compute Black-Scholes PDE residual using Automatic Differentiation
+    in log-S coordinates for numerical stability.
 
-    PDE: ∂V/∂t + ½σ²S²∂²V/∂S² + rS∂V/∂S - rV = 0
+    Let x = log(S). The BS PDE becomes:
+      ∂V/∂t + ½σ²(∂²V/∂x²) + (r - ½σ²)(∂V/∂x) - rV = 0
+
+    This eliminates the S² amplification factor that causes instability
+    with raw S coordinates (S up to 600 → S² up to 360,000×).
 
     Parameters
     ----------
@@ -503,46 +508,57 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
     Returns
     -------
     residual : (batch, n_qS, n_qt) — should be ≈ 0
-    dV_dS, d2V_dS2, dV_dt : Greeks for debugging
+    dV_dS, d2V_dS2, dV_dt : Greeks for debugging (in original S coords)
     """
     with torch.enable_grad():
         batch = sigma.shape[0]
-        # Enable gradients for query coordinates (expanded to have batch dimension)
-        S_q = S_interp.unsqueeze(0).expand(batch, -1).detach().clone().requires_grad_(True)
+        # Use log-S coordinates for stability
+        x_q = torch.log(S_interp + 1e-6)
+        x_q = x_q.unsqueeze(0).expand(batch, -1).detach().clone().requires_grad_(True)
         t_q = t_interp.unsqueeze(0).expand(batch, -1).detach().clone().requires_grad_(True)
-    
+
         # Forward through model
-        V = model.query(sigma, r, K_norm, T_norm, S_q, t_q, S_grid, t_grid)
-    
-        # ∂V/∂S
-        dV_dS = torch.autograd.grad(
-            V.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
+        V = model.query(sigma, r, K_norm, T_norm, x_q, t_q, S_grid, t_grid)
+
+        # ∂V/∂x (in log-S space)
+        dV_dx = torch.autograd.grad(
+            V.sum(), x_q, create_graph=True, retain_graph=True, allow_unused=True
         )[0]
-        dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_q).requires_grad_(True)
-    
-        # ∂²V/∂S²
-        d2V_dS2 = torch.autograd.grad(
-            dV_dS.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
+        dV_dx = dV_dx if dV_dx is not None else torch.zeros_like(x_q).requires_grad_(True)
+
+        # ∂²V/∂x² (in log-S space)
+        d2V_dx2 = torch.autograd.grad(
+            dV_dx.sum(), x_q, create_graph=True, retain_graph=True, allow_unused=True
         )[0]
-        d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_q).requires_grad_(True)
-    
+        d2V_dx2 = d2V_dx2 if d2V_dx2 is not None else torch.zeros_like(x_q).requires_grad_(True)
+
         # ∂V/∂t
         dV_dt = torch.autograd.grad(
             V.sum(), t_q, create_graph=True, retain_graph=True, allow_unused=True
         )[0]
         dV_dt = dV_dt if dV_dt is not None else torch.zeros_like(t_q).requires_grad_(True)
-    
-        # Black-Scholes PDE residual
-        # Gradients have shapes: dV_dS/d2V_dS2 ~ (batch, n_qS), dV_dt ~ (batch, n_qt)
-        S_2d = S_q.unsqueeze(-1)           # (batch, n_qS, 1)
-        dV_dS_3d = dV_dS.unsqueeze(-1)     # (batch, n_qS, 1)
-        d2V_dS2_3d = d2V_dS2.unsqueeze(-1) # (batch, n_qS, 1)
-        dV_dt_3d = dV_dt.unsqueeze(1)      # (batch, 1, n_qt)
+
+        # Convert back to original S coordinates for debugging/reporting
+        # dV/dS = (dV/dx) / S
+        # d2V/dS2 = (d2V/dx2 - dV/dx) / S²
+        S_2d = S_interp.unsqueeze(0).expand(batch, -1)  # (batch, n_qS)
+        dV_dS = dV_dx / (S_2d + 1e-6)
+        d2V_dS2 = (d2V_dx2 - dV_dx) / (S_2d + 1e-6) ** 2
+
+        # Black-Scholes PDE residual in log-S form
+        # ∂V/∂t + ½σ²(∂²V/∂x²) + (r - ½σ²)(∂V/∂x) - rV = 0
+        # Shapes: dV_dx, d2V_dx2 ~ (batch, n_qS), dV_dt ~ (batch, n_qt)
+        x_3d = x_q.unsqueeze(-1)             # (batch, n_qS, 1)
+        dV_dx_3d = dV_dx.unsqueeze(-1)       # (batch, n_qS, 1)
+        d2V_dx2_3d = d2V_dx2.unsqueeze(-1)   # (batch, n_qS, 1)
+        dV_dt_3d = dV_dt.unsqueeze(1)        # (batch, 1, n_qt)
         sigma_3d = sigma.view(-1, 1, 1)
         r_3d = r.view(-1, 1, 1)
-    
-        residual = dV_dt_3d + 0.5 * sigma_3d**2 * S_2d**2 * d2V_dS2_3d + \
-                   r_3d * S_2d * dV_dS_3d - r_3d * V
+
+        residual = (dV_dt_3d
+                    + 0.5 * sigma_3d**2 * d2V_dx2_3d
+                    + (r_3d - 0.5 * sigma_3d**2) * dV_dx_3d
+                    - r_3d * V)
 
         return residual, dV_dS, d2V_dS2, dV_dt
 

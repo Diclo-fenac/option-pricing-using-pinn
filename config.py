@@ -70,6 +70,8 @@ class Config:
     # Logging
     use_wandb = False
     wandb_project = 'fno-option-pricer'
+    wandb_run_id = None                  # Set to resume a specific run
+    wandb_resume = 'allow'               # 'allow', 'must', or None
     run_benchmark = True                 # Automatically run benchmark after training
 
     # =============================================================================
@@ -79,10 +81,16 @@ class Config:
     data_dir = './data'
     checkpoint_dir = './checkpoints'
     results_dir = './results'
-    
+
     # GCP Settings
     gcp_bucket_name = None               # e.g., 'my-option-pricing-bucket'
     gcp_service_account_path = None      # e.g., './service-account-key.json'
+    gcp_prefix = 'pinns'                 # GCS prefix: gs://bucket/{gcp_prefix}/{run_name}/
+
+    # Checkpointing
+    save_every_n_epochs = 15             # Save epoch checkpoint every N epochs
+    save_latest_every_epoch = 1          # Save checkpoint_latest.pt every N epochs
+    resume_from_checkpoint = None        # Path to checkpoint to resume from
     
     # =============================================================================
     # Benchmarking

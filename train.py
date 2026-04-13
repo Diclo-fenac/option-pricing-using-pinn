@@ -11,6 +11,7 @@ Key upgrades:
 import os
 import time
 import math
+import threading
 import numpy as np
 import torch
 import torch.nn as nn
@@ -340,6 +341,7 @@ class FNOTrainer:
         use_pde : bool — if False, skip PDE loss (data-only ablation)
         """
         self.model.train()
+        epoch_total_loss = 0.0
         epoch_data_loss = 0.0
         epoch_pde_loss = 0.0
         n_batches = 0
@@ -367,14 +369,15 @@ class FNOTrainer:
                 weights = self.weighting.update_cheap([data_loss, pde_loss])
             # else: keep previous weights
 
-            total_loss = weights[0] * data_loss + weights[1] * pde_loss
+            weighted_loss = weights[0] * data_loss + weights[1] * pde_loss
 
-            total_loss.backward()
+            weighted_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
+            epoch_total_loss += weighted_loss.item()
             epoch_data_loss += data_loss.item()
-            epoch_pde_loss += pde_loss.item()
+            epoch_pde_loss += pde_loss.item() if weights[1].item() > 0 else 0.0
             n_batches += 1
 
             # Record weights
@@ -384,6 +387,7 @@ class FNOTrainer:
 
         n_batches = max(n_batches, 1)
         return {
+            'total_loss': epoch_total_loss / n_batches,
             'data_loss': epoch_data_loss / n_batches,
             'pde_loss': epoch_pde_loss / n_batches
         }
@@ -563,10 +567,49 @@ class FNOTrainer:
         best_val_loss = float('inf')
         patience_ctr = 0
         t0 = time.time()
+        start_epoch = 0
+        iteration = 0  # Track total batches processed
 
         n_epochs = self.config.n_epochs if hasattr(self.config, 'n_epochs') else 200
-        # Log run-level hyperparameters to WandB if enabled
+
+        # ============================================================
+        # Resume from checkpoint if specified
+        # ============================================================
+        resume_path = getattr(self.config, 'resume_from_checkpoint', None)
+        if resume_path and os.path.exists(resume_path):
+            start_epoch, iteration = self.load_checkpoint(resume_path)
+            best_val_loss = min(self.history.get('val_rmse', [float('inf')]))
+            if best_val_loss == float('inf'):
+                best_val_loss = float('inf')
+            patience_ctr = 0
+
+        # ============================================================
+        # WandB initialization with resume support
+        # ============================================================
         if hasattr(self.config, 'use_wandb') and self.config.use_wandb and _HAS_WANDB:
+            wandb_run_id = getattr(self.config, 'wandb_run_id', None)
+            wandb_resume = getattr(self.config, 'wandb_resume', 'allow')
+
+            # If resuming and we have a run_id from checkpoint, use it
+            if start_epoch > 0 and 'wandb_run_id' in self.history:
+                wandb_run_id = self.history['wandb_run_id']
+
+            # Initialize or resume WandB run
+            if wandb_run_id and wandb_resume in ['allow', 'must']:
+                run = wandb.init(
+                    project=self.config.wandb_project,
+                    id=wandb_run_id,
+                    resume=wandb_resume,
+                )
+            else:
+                run = wandb.init(
+                    project=self.config.wandb_project,
+                    name=self.config.run_name,
+                )
+                # Store run ID for resume
+                self.config.wandb_run_id = run.id
+                self.history['wandb_run_id'] = run.id
+
             wandb.config.update({
                 'n_epochs': n_epochs,
                 'batch_size': self.config.batch_size,
@@ -581,9 +624,10 @@ class FNOTrainer:
                 'fno_layers': getattr(self.config, 'fno_layers', None),
                 'fno_width': getattr(self.config, 'fno_width', None),
                 'random_seed': torch.initial_seed(),
+                'resume_from_epoch': start_epoch,
             })
 
-        for epoch in range(n_epochs):
+        for epoch in range(start_epoch, n_epochs):
             t_epoch = time.time()
             
             # LR schedule
@@ -606,9 +650,7 @@ class FNOTrainer:
             epoch_time = time.time() - t_epoch
 
             # Record
-            self.history['train_loss'].append(
-                train_losses['data_loss'] + train_losses['pde_loss']
-            )
+            self.history['train_loss'].append(train_losses['total_loss'])
             self.history['val_loss'].append(val_loss)
             self.history['train_data_loss'].append(train_losses['data_loss'])
             self.history['train_pde_loss'].append(train_losses['pde_loss'])
@@ -658,12 +700,26 @@ class FNOTrainer:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_ctr = 0
-                self.save('best')
+                self.save('best', epoch=epoch, iteration=iteration)
             else:
                 patience_ctr += 1
                 if patience_ctr >= patience:
                     print(f"\nEarly stop at epoch {epoch+1}")
                     break
+
+            # Save latest checkpoint (for resume)
+            save_latest_n = getattr(self.config, 'save_latest_every_epoch', 1)
+            if (epoch + 1) % save_latest_n == 0:
+                self.save('checkpoint_latest', epoch=epoch, iteration=iteration)
+
+            # Save epoch checkpoint every N epochs
+            save_every_n = getattr(self.config, 'save_every_n_epochs', 10)
+            if (epoch + 1) % save_every_n == 0:
+                epoch_name = f'checkpoint_epoch_{epoch+1:04d}'
+                self.save(epoch_name, epoch=epoch, iteration=iteration)
+
+            # Update iteration counter
+            iteration += len(train_loader)
 
         self.save('final')
         # Final evaluation on validation set (as test proxy)
@@ -677,31 +733,119 @@ class FNOTrainer:
 
         return self.history
 
-    def save(self, name):
-        """Save checkpoint and optionally upload to GCP."""
+    def save(self, name, epoch=None, iteration=None):
+        """Save checkpoint with structured naming and async GCP upload.
+
+        Parameters
+        ----------
+        name : str — 'latest', 'best', or 'epoch_{N}'
+        epoch : int — current epoch number (for checkpoint metadata)
+        iteration : int — current iteration (for checkpoint metadata)
+        """
         d = self.config.checkpoint_dir if hasattr(self.config, 'checkpoint_dir') else './checkpoints'
         run_name = self.config.run_name if hasattr(self.config, 'run_name') else 'model'
         full_name = f'{run_name}_{name}.pt'
         path = os.path.join(d, full_name)
-        torch.save({
+
+        checkpoint = {
+            'epoch': epoch if epoch is not None else -1,
+            'iteration': iteration if iteration is not None else -1,
+            'run_name': run_name,
             'model': self.model.state_dict(),
-            'optim': self.optimizer.state_dict(),
-            'sched': self.scheduler.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
             'history': self.history,
-        }, path)
+            'config': {
+                'S_grid_size': getattr(self.config, 'S_grid_size', None),
+                't_grid_size': getattr(self.config, 't_grid_size', None),
+                'fno_modes': getattr(self.config, 'fno_modes', None),
+                'fno_layers': getattr(self.config, 'fno_layers', None),
+                'fno_width': getattr(self.config, 'fno_width', None),
+            }
+        }
+
+        torch.save(checkpoint, path)
+
         # Upload to WandB as a file for easy access
         if hasattr(self.config, 'use_wandb') and self.config.use_wandb and _HAS_WANDB:
             try:
                 wandb.save(path)
             except Exception:
                 pass
-                
-        # GCP Upload
+
+        # Async GCP Upload (non-blocking)
         if hasattr(self.config, 'gcp_bucket_name') and self.config.gcp_bucket_name and \
            hasattr(self.config, 'gcp_service_account_path') and self.config.gcp_service_account_path:
+            gcp_prefix = getattr(self.config, 'gcp_prefix', 'pinns')
+            dest_blob = f"{gcp_prefix}/{run_name}/{full_name}"
+            thread = threading.Thread(
+                target=self._upload_to_gcp_async,
+                args=(path, dest_blob),
+                daemon=True
+            )
+            thread.start()
+
+    def _upload_to_gcp_async(self, local_path, dest_blob):
+        """Async GCP upload in a background thread to avoid blocking training."""
+        try:
             from utils import upload_to_gcp_bucket
-            dest_blob = f"models/{run_name}/{full_name}"
-            upload_to_gcp_bucket(path, self.config.gcp_bucket_name, dest_blob, self.config.gcp_service_account_path)
+            upload_to_gcp_bucket(
+                local_path,
+                self.config.gcp_bucket_name,
+                dest_blob,
+                self.config.gcp_service_account_path
+            )
+        except Exception as e:
+            print(f"[GCP Upload Warning] Failed to upload {local_path}: {e}")
+
+    def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint and restore model, optimizer, scheduler, and history.
+
+        Parameters
+        ----------
+        checkpoint_path : str — path to checkpoint file
+
+        Returns
+        -------
+        resume_epoch : int — epoch to resume from
+        resume_iter : int — iteration to resume from
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        print(f"\n{'='*60}")
+        print(f"Loading checkpoint: {checkpoint_path}")
+        print(f"{'='*60}\n")
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # Load model state
+        self.model.load_state_dict(checkpoint['model'])
+        print(f"✓ Model state loaded")
+
+        # Load optimizer state
+        if 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+            print(f"✓ Optimizer state loaded")
+
+        # Load scheduler state
+        if 'scheduler' in checkpoint and checkpoint['scheduler'] is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
+            print(f"✓ Scheduler state loaded")
+
+        # Load history
+        if 'history' in checkpoint:
+            self.history = checkpoint['history']
+            print(f"✓ Training history loaded ({len(self.history.get('train_loss', []))} epochs)")
+
+        resume_epoch = checkpoint.get('epoch', -1) + 1  # +1 because we start from next epoch
+        resume_iter = checkpoint.get('iteration', -1) + 1
+
+        print(f"\nResuming from epoch {resume_epoch} (was at epoch {checkpoint.get('epoch', -1)})")
+        print(f"Best val RMSE so far: {min(self.history['val_rmse']):.6e}" if self.history.get('val_rmse') else "No val RMSE history")
+        print(f"{'='*60}\n")
+
+        return resume_epoch, resume_iter
 
     def _final_evaluation(self, dataloader):
         """Compute final evaluation metrics on provided dataloader.
@@ -938,12 +1082,13 @@ def train_model(config):
         from utils import upload_to_gcp_bucket
         run_name = config.run_name if hasattr(config, 'run_name') else 'model'
         d = config.checkpoint_dir if hasattr(config, 'checkpoint_dir') else './checkpoints'
-        
-        for name in ['best', 'final']:
+        gcp_prefix = getattr(config, 'gcp_prefix', 'pinns')
+
+        for name in ['best', 'final', 'checkpoint_latest']:
             full_name = f'{run_name}_{name}.pt'
             path = os.path.join(d, full_name)
             if os.path.exists(path):
-                dest_blob = f"models/{run_name}/{full_name}"
+                dest_blob = f"{gcp_prefix}/{run_name}/{full_name}"
                 upload_to_gcp_bucket(path, config.gcp_bucket_name, dest_blob, config.gcp_service_account_path)
 
     # Optional: Run full benchmark suite immediately after training
@@ -956,6 +1101,67 @@ def train_model(config):
 
     return history
 
+
+# =============================================================================
+# Standalone Checkpoint Utilities
+# =============================================================================
+
+def load_checkpoint_for_resume(checkpoint_path, device=None):
+    """
+    Load a checkpoint and return its metadata for inspection or manual resume.
+
+    Parameters
+    ----------
+    checkpoint_path : str — path to checkpoint file
+    device : torch.device — device to load tensors on
+
+    Returns
+    -------
+    checkpoint : dict — full checkpoint data
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    print(f"\n{'='*60}")
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"{'='*60}")
+    print(f"Run name:     {checkpoint.get('run_name', 'N/A')}")
+    print(f"Epoch:        {checkpoint.get('epoch', -1)}")
+    print(f"Iteration:    {checkpoint.get('iteration', -1)}")
+    print(f"Best val RMSE: {min(checkpoint.get('history', {}).get('val_rmse', [float('inf')])):.6e}")
+    print(f"Config:       {checkpoint.get('config', {})}")
+    print(f"{'='*60}\n")
+
+    return checkpoint
+
+
+def inspect_checkpoint(checkpoint_path, device=None):
+    """
+    Quick utility to inspect a checkpoint without loading full state.
+
+    Parameters
+    ----------
+    checkpoint_path : str
+    device : torch.device
+    """
+    cp = load_checkpoint_for_resume(checkpoint_path, device)
+    return {
+        'run_name': cp.get('run_name'),
+        'epoch': cp.get('epoch'),
+        'iteration': cp.get('iteration'),
+        'history_length': len(cp.get('history', {}).get('train_loss', [])),
+        'config': cp.get('config', {}),
+    }
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 
 if __name__ == '__main__':
     from config import Config
