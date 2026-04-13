@@ -388,8 +388,13 @@ class FNOOptionPricer(nn.Module):
         features = self.feature_proj(x) # (batch, width, n_S, n_t)
 
         # 2. Interpolate grid features to query meshgrid
-        # S_query: (n_qS,), t_query: (n_qt,)
-        S_mesh_q, t_mesh_q = torch.meshgrid(S_query, t_query, indexing='ij')
+        # S_query: (n_qS,) or (batch, n_qS)
+        if S_query.dim() == 1:
+            S_mesh_q, t_mesh_q = torch.meshgrid(S_query, t_query, indexing='ij')
+        else:
+            # S_query is (batch, n_qS), t_query is (batch, n_qt)
+            S_mesh_q = S_query.unsqueeze(2).expand(-1, -1, t_query.shape[1])
+            t_mesh_q = t_query.unsqueeze(1).expand(-1, S_query.shape[1], -1)
         
         # Bilinear interpolation of features
         # features: (batch, width, n_S, n_t)
@@ -422,41 +427,69 @@ class FNOOptionPricer(nn.Module):
 
         V: (batch, n_S, n_t)
         S_grid: (n_S,), t_grid: (n_t,)
-        S_q: (n_qS,), t_q: (n_qt,)
+        S_q: (n_qS,) or (batch, n_qS), t_q: (n_qt,) or (batch, n_qt)
 
         Returns: (batch, n_qS, n_qt)
         """
         batch, n_S, n_t = V.shape
-        n_qS, n_qt = len(S_q), len(t_q)
 
-        # Normalize query coordinates to [0, n-1] index space
-        s_idx = (S_q - S_grid[0]) / (S_grid[-1] - S_grid[0] + 1e-8) * (n_S - 1)
-        t_idx = (t_q - t_grid[0]) / (t_grid[-1] - t_grid[0] + 1e-8) * (n_t - 1)
-
-        s_idx = s_idx.clamp(0, n_S - 2)
-        t_idx = t_idx.clamp(0, n_t - 2)
-
-        s0 = s_idx.floor().long()
-        s1 = s0 + 1
-        t0 = t_idx.floor().long()
-        t1 = t0 + 1
-
-        # Interpolation weights — first-order gradient path through s_idx, t_idx
-        ws = s_idx - s0.float()  # (n_qS,)
-        wt = t_idx - t0.float()  # (n_qt,)
-
-        # Gather corner values: V[batch, s, t]
-        # Shape: (batch, n_qS, n_qt)
-        c00 = V[torch.arange(batch)[:, None, None], s0[:, None], t0[None, :]]
-        c10 = V[torch.arange(batch)[:, None, None], s1[:, None], t0[None, :]]
-        c01 = V[torch.arange(batch)[:, None, None], s0[:, None], t1[None, :]]
-        c11 = V[torch.arange(batch)[:, None, None], s1[:, None], t1[None, :]]
-
-        # Bilinear interpolation
-        V_q = (c00 * (1 - ws)[:, None] * (1 - wt)[None, :] +
-               c10 * ws[:, None] * (1 - wt)[None, :] +
-               c01 * (1 - ws)[:, None] * wt[None, :] +
-               c11 * ws[:, None] * wt[None, :])
+        if S_q.dim() == 1:
+            n_qS, n_qt = S_q.shape[0], t_q.shape[0]
+    
+            # Normalize query coordinates to [0, n-1] index space
+            s_idx = (S_q - S_grid[0]) / (S_grid[-1] - S_grid[0] + 1e-8) * (n_S - 1)
+            t_idx = (t_q - t_grid[0]) / (t_grid[-1] - t_grid[0] + 1e-8) * (n_t - 1)
+    
+            s_idx = s_idx.clamp(0, n_S - 2)
+            t_idx = t_idx.clamp(0, n_t - 2)
+    
+            s0 = s_idx.floor().long()
+            s1 = s0 + 1
+            t0 = t_idx.floor().long()
+            t1 = t0 + 1
+    
+            # Interpolation weights — first-order gradient path through s_idx, t_idx
+            ws = s_idx - s0.float()  # (n_qS,)
+            wt = t_idx - t0.float()  # (n_qt,)
+    
+            b_idx = torch.arange(batch, device=V.device)[:, None, None]
+            c00 = V[b_idx, s0[:, None], t0[None, :]]
+            c10 = V[b_idx, s1[:, None], t0[None, :]]
+            c01 = V[b_idx, s0[:, None], t1[None, :]]
+            c11 = V[b_idx, s1[:, None], t1[None, :]]
+    
+            # Bilinear interpolation
+            V_q = (c00 * (1 - ws)[:, None] * (1 - wt)[None, :] +
+                   c10 * ws[:, None] * (1 - wt)[None, :] +
+                   c01 * (1 - ws)[:, None] * wt[None, :] +
+                   c11 * ws[:, None] * wt[None, :])
+        else:
+            n_qS, n_qt = S_q.shape[1], t_q.shape[1]
+    
+            s_idx = (S_q - S_grid[0]) / (S_grid[-1] - S_grid[0] + 1e-8) * (n_S - 1)
+            t_idx = (t_q - t_grid[0]) / (t_grid[-1] - t_grid[0] + 1e-8) * (n_t - 1)
+    
+            s_idx = s_idx.clamp(0, n_S - 2)
+            t_idx = t_idx.clamp(0, n_t - 2)
+    
+            s0 = s_idx.floor().long()
+            s1 = s0 + 1
+            t0 = t_idx.floor().long()
+            t1 = t0 + 1
+    
+            ws = s_idx - s0.float()  # (batch, n_qS)
+            wt = t_idx - t0.float()  # (batch, n_qt)
+    
+            b_idx = torch.arange(batch, device=V.device)[:, None, None]
+            c00 = V[b_idx, s0.unsqueeze(2), t0.unsqueeze(1)]
+            c10 = V[b_idx, s1.unsqueeze(2), t0.unsqueeze(1)]
+            c01 = V[b_idx, s0.unsqueeze(2), t1.unsqueeze(1)]
+            c11 = V[b_idx, s1.unsqueeze(2), t1.unsqueeze(1)]
+    
+            V_q = (c00 * (1 - ws).unsqueeze(2) * (1 - wt).unsqueeze(1) +
+                   c10 * ws.unsqueeze(2) * (1 - wt).unsqueeze(1) +
+                   c01 * (1 - ws).unsqueeze(2) * wt.unsqueeze(1) +
+                   c11 * ws.unsqueeze(2) * wt.unsqueeze(1))
 
         return V_q
 
@@ -483,9 +516,10 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
     dV_dS, d2V_dS2, dV_dt : Greeks for debugging
     """
     with torch.enable_grad():
-        # Enable gradients for query coordinates
-        S_q = S_interp.detach().clone().requires_grad_(True)
-        t_q = t_interp.detach().clone().requires_grad_(True)
+        batch = sigma.shape[0]
+        # Enable gradients for query coordinates (expanded to have batch dimension)
+        S_q = S_interp.unsqueeze(0).expand(batch, -1).detach().clone().requires_grad_(True)
+        t_q = t_interp.unsqueeze(0).expand(batch, -1).detach().clone().requires_grad_(True)
     
         # Forward through model
         V = model.query(sigma, r, K_norm, T_norm, S_q, t_q, S_grid, t_grid)
@@ -509,12 +543,11 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
         dV_dt = dV_dt if dV_dt is not None else torch.zeros_like(t_q).requires_grad_(True)
     
         # Black-Scholes PDE residual
-        # Gradients have shapes: dV_dS/d2V_dS2 ~ (n_qS,), dV_dt ~ (n_qt,)
-        # Need to broadcast to (batch, n_qS, n_qt) to match V
-        S_2d = S_q.view(1, -1, 1)           # (1, n_qS, 1)
-        dV_dS_3d = dV_dS.view(1, -1, 1)     # (1, n_qS, 1)
-        d2V_dS2_3d = d2V_dS2.view(1, -1, 1) # (1, n_qS, 1)
-        dV_dt_3d = dV_dt.view(1, 1, -1)     # (1, 1, n_qt)
+        # Gradients have shapes: dV_dS/d2V_dS2 ~ (batch, n_qS), dV_dt ~ (batch, n_qt)
+        S_2d = S_q.unsqueeze(-1)           # (batch, n_qS, 1)
+        dV_dS_3d = dV_dS.unsqueeze(-1)     # (batch, n_qS, 1)
+        d2V_dS2_3d = d2V_dS2.unsqueeze(-1) # (batch, n_qS, 1)
+        dV_dt_3d = dV_dt.unsqueeze(1)      # (batch, 1, n_qt)
         sigma_3d = sigma.view(-1, 1, 1)
         r_3d = r.view(-1, 1, 1)
     
@@ -534,22 +567,20 @@ def compute_greeks_autograd(model, sigma, r, K_norm, T_norm,
         # Use middle of time grid for Greeks
         t_mid = t_grid[len(t_grid) // 2:len(t_grid) // 2 + 1]
         
-        # Meshgrid for AD
-        S_mesh, t_mesh = torch.meshgrid(S_query, t_mid, indexing='ij')
-        S_mesh = S_mesh.detach().clone().requires_grad_(True)
+        # Expand for batch dimension
+        S_query_batched = S_query.unsqueeze(0).expand(batch, -1).detach().clone().requires_grad_(True)
+        t_mid_batched = t_mid.unsqueeze(0).expand(batch, -1).detach().clone().requires_grad_(True)
     
-        V = model.query(sigma, r, K_norm, T_norm, S_mesh, t_mesh, S_grid, t_grid)
+        V = model.query(sigma, r, K_norm, T_norm, S_query_batched, t_mid_batched, S_grid, t_grid)
     
         dV_dS = torch.autograd.grad(
-            V, S_mesh, grad_outputs=torch.ones_like(V),
-            create_graph=True, retain_graph=True, allow_unused=True
+            V.sum(), S_query_batched, create_graph=True, retain_graph=True, allow_unused=True
         )[0]
-        dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_mesh).requires_grad_(True)
+        dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_query_batched).requires_grad_(True)
     
         d2V_dS2 = torch.autograd.grad(
-            dV_dS, S_mesh, grad_outputs=torch.ones_like(dV_dS),
-            create_graph=True, retain_graph=True, allow_unused=True
+            dV_dS.sum(), S_query_batched, create_graph=True, retain_graph=True, allow_unused=True
         )[0]
-        d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_mesh).requires_grad_(True)
+        d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_query_batched).requires_grad_(True)
     
-        return dV_dS.squeeze(-1), d2V_dS2.squeeze(-1)
+        return dV_dS, d2V_dS2

@@ -456,9 +456,10 @@ class FNOTrainer:
                         n_t = len(self.t_grid)
                         S_ref = self.S_grid[n_S // 2:n_S // 2 + 1]
                         t_ref = self.t_grid[n_t // 2:n_t // 2 + 1]
-    
-                        S_q = S_ref.detach().clone().requires_grad_(True)
-                        t_q = t_ref.detach().clone().requires_grad_(True)
+                        
+                        batch_size = sigma.shape[0]
+                        S_q = S_ref.unsqueeze(0).expand(batch_size, -1).detach().clone().requires_grad_(True)
+                        t_q = t_ref.unsqueeze(0).expand(batch_size, -1).detach().clone().requires_grad_(True)
     
                         V_q = self.model.query(sigma, r, K_norm, T_norm, S_q, t_q,
                                                self.S_grid, self.t_grid)
@@ -468,8 +469,8 @@ class FNOTrainer:
                         d2V_dS2 = torch.autograd.grad(dV_dS.sum(), S_q, create_graph=False)[0]
 
                     # Extract at reference point (middle of S grid, middle of time grid)
-                    Delta_pred = dV_dS  # (batch, 1, 1)
-                    Gamma_pred = d2V_dS2  # (batch, 1, 1)
+                    Delta_pred = dV_dS  # (batch, 1)
+                    Gamma_pred = d2V_dS2  # (batch, 1)
 
                     # True Greeks at same point (middle S, middle t)
                     # Delta_true: (batch, n_S, n_t) → extract middle
@@ -477,10 +478,10 @@ class FNOTrainer:
                     Gamma_true_ref = Gamma_true[:, n_S // 2, n_t // 2]
 
                     delta_rmse = torch.sqrt(torch.mean(
-                        (Delta_pred.squeeze() - Delta_true_ref) ** 2
+                        (Delta_pred.view(-1) - Delta_true_ref) ** 2
                     ))
                     gamma_rmse = torch.sqrt(torch.mean(
-                        (Gamma_pred.squeeze() - Gamma_true_ref) ** 2
+                        (Gamma_pred.view(-1) - Gamma_true_ref) ** 2
                     ))
 
                     total_delta_rmse += delta_rmse.item() * len(sigma)
