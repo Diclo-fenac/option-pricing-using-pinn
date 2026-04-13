@@ -57,9 +57,9 @@ class AdaptiveLossWeights:
         self.min_w = min_weight
         self.max_w = max_weight
         # Track moving average of gradient norms
-        self.grad_norms_ema = torch.ones(n_terms)
+        self.grad_norms_ema = None
         # Track moving average of loss values
-        self.loss_ema = torch.ones(n_terms)
+        self.loss_ema = None
 
     def update(self, model, loss_terms):
         """
@@ -86,7 +86,10 @@ class AdaptiveLossWeights:
                     norm_sq += p.grad.data.norm(2).item() ** 2
             grad_norms.append(math.sqrt(norm_sq) + 1e-8)
 
-        grad_norms = torch.tensor(grad_norms)
+        grad_norms = torch.tensor(grad_norms, device=loss_terms[0].device)
+
+        if self.grad_norms_ema is None:
+            self.grad_norms_ema = torch.ones(self.n_terms, device=loss_terms[0].device)
 
         # EMA update
         self.grad_norms_ema = (
@@ -116,7 +119,10 @@ class AdaptiveLossWeights:
         -------
         weights : (n_terms,)
         """
-        losses = torch.tensor([l.item() + 1e-12 for l in loss_terms])
+        losses = torch.tensor([l.item() + 1e-12 for l in loss_terms], device=loss_terms[0].device)
+
+        if self.loss_ema is None:
+            self.loss_ema = torch.ones(self.n_terms, device=loss_terms[0].device)
 
         # EMA of loss magnitudes
         self.loss_ema = self.alpha * self.loss_ema + (1 - self.alpha) * losses
@@ -126,7 +132,7 @@ class AdaptiveLossWeights:
         weights = 1.0 / (ratios * self.n_terms)
         weights = weights.clamp(self.min_w, self.max_w)
 
-        return weights
+        return weights.to(loss_terms[0].device)
 
 
 # Curriculum Scheduler
@@ -157,8 +163,9 @@ class CurriculumScheduler:
         mask : (N,) bool
         """
         sigma = params[:, 0]
-        K_norm = params[:, 1]
-        T_norm = params[:, 2]
+        # r = params[:, 1]  # not used in curriculum
+        K_norm = params[:, 2]
+        T_norm = params[:, 3]
 
         # Denormalize for readability
         # K_norm = K / 100, T_norm = T / 2.0
@@ -336,6 +343,7 @@ class FNOTrainer:
         epoch_data_loss = 0.0
         epoch_pde_loss = 0.0
         n_batches = 0
+        weights = torch.tensor([1.0, 0.0], device=self.device)
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f'Epoch {epoch+1}', leave=False)):
             # Curriculum filtering
@@ -355,8 +363,9 @@ class FNOTrainer:
             if epoch < 5 or not use_pde:
                 # Warm-up or data-only: data loss only
                 weights = torch.tensor([1.0, 0.0], device=self.device)
-            else:
+            elif use_pde and (batch_idx % 3 == 0):
                 weights = self.weighting.update_cheap([data_loss, pde_loss])
+            # else: keep previous weights
 
             total_loss = weights[0] * data_loss + weights[1] * pde_loss
 
@@ -576,14 +585,7 @@ class FNOTrainer:
 
         for epoch in range(n_epochs):
             t_epoch = time.time()
-            # Train (pass use_pde through to epoch)
-            train_losses = self.train_epoch(train_loader, epoch, use_curriculum=True, use_pde=use_pde)
-
-            # Validate
-            val_metrics = self.validate(val_loader)
-            val_loss = val_metrics['rmse']
-            epoch_time = time.time() - t_epoch
-
+            
             # LR schedule
             warmup_epochs = 5
             base_lr = self.config.learning_rate if hasattr(self.config, 'learning_rate') else 1e-3
@@ -594,6 +596,14 @@ class FNOTrainer:
             else:
                 self.scheduler.step()
                 lr = self.scheduler.get_last_lr()[0]
+
+            # Train (pass use_pde through to epoch)
+            train_losses = self.train_epoch(train_loader, epoch, use_curriculum=True, use_pde=use_pde)
+
+            # Validate
+            val_metrics = self.validate(val_loader)
+            val_loss = val_metrics['rmse']
+            epoch_time = time.time() - t_epoch
 
             # Record
             self.history['train_loss'].append(

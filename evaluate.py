@@ -78,22 +78,22 @@ def _load_test_data(data_dir):
     path = os.path.join(data_dir, 'test.h5')
     with h5py.File(path, 'r') as f:
         keys = list(f.keys())
-
-    if 'params' not in keys:
-        raise ValueError(
-            f"Data file {path} uses the old format (separate sigma/r/K keys). "
-            "Evaluation requires the large-scale format with 'params (N,4)' key. "
-            "Generate data with: python data_generator_large.py --n_samples 10000"
-        )
-
-    return {
-        'params': f['params'][:],        # (N, 4) [σ, r, K, T]
-        'V': f['V'][:],                   # (N, n_S, n_t)
-        'Delta': f['Delta'][:],
-        'Gamma': f['Gamma'][:],
-        'S_grid': f['S_grid'][:],         # (n_S,)
-        't_template': f['t_template'][:], # (n_t,)
-    }
+    
+        if 'params' not in keys:
+            raise ValueError(
+                f"Data file {path} uses the old format (separate sigma/r/K keys). "
+                "Evaluation requires the large-scale format with 'params (N,4)' key. "
+                "Generate data with: python data_generator_large.py --n_samples 10000"
+            )
+    
+        return {
+            'params': f['params'][:],        # (N, 4) [σ, r, K, T]
+            'V': f['V'][:],                   # (N, n_S, n_t)
+            'Delta': f['Delta'][:],
+            'Gamma': f['Gamma'][:],
+            'S_grid': f['S_grid'][:],         # (n_S,)
+            't_template': f['t_template'][:], # (n_t,)
+        }
 
 
 def _predict_surfaces(model, data, device, batch_size=128):
@@ -120,7 +120,8 @@ def _predict_surfaces(model, data, device, batch_size=128):
 
 def relative_l2(V_pred, V_true):
     """Compute relative L2 error: ||V_pred - V_true|| / ||V_true||"""
-    return float(torch.norm(torch.tensor(V_pred - V_true)) / torch.norm(torch.tensor(V_true)))
+    diff = V_pred - V_true
+    return float(np.linalg.norm(diff) / (np.linalg.norm(V_true) + 1e-12))
 
 
 # 1. Relative L2 Error (Full Test Set)
@@ -356,9 +357,10 @@ def compare_fdm_baseline(data, model, device, subset=100):
     fdm_per_sample = fdm_elapsed / n
 
     # FDM accuracy vs analytical
-    fdm_rmse = np.sqrt(np.mean((V_fdm - V_true) ** 2))
-    fdm_max = np.max(np.abs(V_fdm - V_true))
-    fdm_l2 = relative_l2(V_fdm, V_true)
+    V_true_subset = V_true[indices]
+    fdm_rmse = np.sqrt(np.mean((V_fdm - V_true_subset) ** 2))
+    fdm_max = np.max(np.abs(V_fdm - V_true_subset))
+    fdm_l2 = relative_l2(V_fdm, V_true_subset)
 
     print(f"  FDM RMSE:      {fdm_rmse:.8f}")
     print(f"  FDM Max Error: {fdm_max:.6f}")
@@ -491,7 +493,7 @@ def _make_config(base_config, use_pde):
     """Create a config copy with PDE-specific settings."""
     import types
     cfg = types.SimpleNamespace()
-    for k, v in vars(base_config).items() if hasattr(base_config, '__dict__') else base_config.__dict__.items():
+    for k, v in vars(base_config).items():
         setattr(cfg, k, v)
 
     # Override for ablation

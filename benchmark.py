@@ -17,6 +17,7 @@ import time
 import numpy as np
 import torch
 import h5py
+import scipy.special
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -30,7 +31,7 @@ from fdm_solver import FDMSolver
 # Helpers
 # =============================================================================
 
-def _vectorized_bs_price(S_grid, t_grid, sigma, r, K, T, t_template):
+def _vectorized_bs_price(S_grid, sigma, r, K, T, t_template):
     """
     Fully vectorized Black-Scholes call price surface.
 
@@ -180,7 +181,7 @@ def benchmark_bs_speed(data, config):
     V_list = []
     for i in range(n):
         sigma, r, K, T = params[i]
-        V_i = _vectorized_bs_price(S_grid, t_template, sigma, r, K, T, t_template)
+        V_i = _vectorized_bs_price(S_grid, sigma, r, K, T, t_template)
         V_list.append(V_i)
     elapsed_loop = time.perf_counter() - t0
     per_sample_loop = elapsed_loop / n
@@ -529,22 +530,21 @@ def compute_pde_residual_quality(data, config, model_path):
 
     residuals = []
 
-    with torch.no_grad():
-        for start in range(0, n_test, 16):
-            end = min(start + 16, n_test)
-            batch_idx = indices[start:end]
+    for start in range(0, n_test, 16):
+        end = min(start + 16, n_test)
+        batch_idx = indices[start:end]
 
-            sigma = torch.tensor(params[batch_idx, 0], dtype=torch.float32, device=device)
-            r = torch.tensor(params[batch_idx, 1], dtype=torch.float32, device=device)
-            K_norm = torch.tensor(params[batch_idx, 2], dtype=torch.float32, device=device) / 100.0
-            T_norm = torch.tensor(params[batch_idx, 3], dtype=torch.float32, device=device) / 2.0
+        sigma = torch.tensor(params[batch_idx, 0], dtype=torch.float32, device=device)
+        r = torch.tensor(params[batch_idx, 1], dtype=torch.float32, device=device)
+        K_norm = torch.tensor(params[batch_idx, 2], dtype=torch.float32, device=device) / 100.0
+        T_norm = torch.tensor(params[batch_idx, 3], dtype=torch.float32, device=device) / 2.0
 
-            res, _, _, _ = compute_pde_residual_autograd(
-                model, sigma, r, K_norm, T_norm,
-                S_grid, t_template,
-                S_interior, t_interior
-            )
-            residuals.append(res.abs().cpu().numpy())
+        res, _, _, _ = compute_pde_residual_autograd(
+            model, sigma, r, K_norm, T_norm,
+            S_grid, t_template,
+            S_interior, t_interior
+        )
+        residuals.append(res.abs().cpu().detach().numpy())
 
     residuals = np.concatenate(residuals, axis=0)
     mean_res = np.mean(residuals)
@@ -590,9 +590,9 @@ def test_distribution_shift(data, config, model_path):
     print("Training: σ∈[0.05,0.80]  r∈[0.0,0.15]  K∈[20,200]  T∈[0.1,2.0]")
 
     results = {}
+    np.random.seed(42)
 
     for name, rng in scenarios.items():
-        np.random.seed(42)
         n = 200
 
         sigmas = np.random.uniform(*rng['sigma'], n).astype(np.float32)
@@ -603,7 +603,7 @@ def test_distribution_shift(data, config, model_path):
         V_true_list = []
         for i in range(n):
             v = _vectorized_bs_price(
-                data['S_grid'], data['t_template'],
+                data['S_grid'],
                 sigmas[i], rates[i], Ks[i], Ts[i], data['t_template']
             )
             V_true_list.append(v)

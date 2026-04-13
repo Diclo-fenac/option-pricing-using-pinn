@@ -48,7 +48,7 @@ class SpectralConv2d(nn.Module):
         out1 = self._mul(x_ft[:, :, :self.modes1, :self.modes2], self.w1)
         out2 = self._mul(x_ft[:, :, -self.modes1:, :self.modes2], self.w2)
 
-        mid_rows = nx - 2 * self.modes1
+        mid_rows = max(0, nx - 2 * self.modes1)
         z_mid = torch.zeros(b, self.out_c, mid_rows, self.modes2,
                             dtype=x_ft.dtype, device=x.device)
         z_right = torch.zeros(b, self.out_c, nx, ny_half - self.modes2,
@@ -199,7 +199,7 @@ class HardConstrainedOutput(nn.Module):
     """
     Enforces boundary conditions by construction:
 
-    V(S, t) = payoff(S, K) · exp(-τ) + V̂_raw · τ · S/(S+K) · σ(5·τ)
+    V(S, t) = payoff(S, K) · indicator(τ=0) + V̂_raw · τ · S/(S+K) · σ(5·τ)
 
     where:
       τ = T - t (time to maturity)
@@ -244,8 +244,8 @@ class HardConstrainedOutput(nn.Module):
 
         modulation = tau * S_mod * sigmoid_tau
 
-        # Hard-constrained output
-        V = payoff + V_raw * modulation
+        # Hard-constrained output (apply payoff purely as terminal constraint)
+        V = payoff * (tau <= 1e-8).float() + V_raw * modulation
 
         return V
 
@@ -303,11 +303,6 @@ class FNOOptionPricer(nn.Module):
             hidden_dim=128,
             num_layers=3
         )
-
-    def set_active_modes(self, modes):
-        """Dynamically adjust modes for iFNO strategy."""
-        for block in self.fourier_blocks:
-            block.spec.active_modes = modes
 
     def forward(self, sigma, r, K_norm, T_norm, S_grid, t_grid, return_raw=False):
         """
@@ -396,16 +391,25 @@ class FNOOptionPricer(nn.Module):
             S_mesh_q = S_query.unsqueeze(2).expand(-1, -1, t_query.shape[1])
             t_mesh_q = t_query.unsqueeze(1).expand(-1, S_query.shape[1], -1)
         
-        # Bilinear interpolation of features
+        # Bilinear interpolation of features using F.grid_sample
         # features: (batch, width, n_S, n_t)
-        # _bilinear_interpolate expect V: (batch, n_S, n_t)
-        # We'll apply it per feature channel
-        feat_list = []
-        for i in range(self.width):
-            f_chan = self._bilinear_interpolate(features[:, i, :, :], S_grid, t_grid, S_query, t_query)
-            feat_list.append(f_chan.unsqueeze(-1))
+        # We need grid in [-1, 1] for grid_sample. H=n_S, W=n_t.
+        # grid[..., 0] is x (t dimension), grid[..., 1] is y (S dimension)
+        S_min, S_max = S_grid[0], S_grid[-1]
+        t_min, t_max = t_grid[0], t_grid[-1]
         
-        feat_interp = torch.cat(feat_list, dim=-1) # (batch, n_qS, n_qt, width)
+        S_norm = (S_mesh_q - S_min) / (S_max - S_min + 1e-8) * 2.0 - 1.0
+        t_norm = (t_mesh_q - t_min) / (t_max - t_min + 1e-8) * 2.0 - 1.0
+        
+        # grid shape: (batch, n_qS, n_qt, 2)
+        grid = torch.stack((t_norm, S_norm), dim=-1)
+        if grid.dim() == 3:
+            # Expand to batch dimension
+            grid = grid.unsqueeze(0).expand(batch_size, -1, -1, -1)
+            
+        feat_interp = F.grid_sample(features, grid, mode='bilinear', align_corners=True)
+        # feat_interp: (batch, width, n_qS, n_qt) -> (batch, n_qS, n_qt, width)
+        feat_interp = feat_interp.permute(0, 2, 3, 1)
 
         # 3. Evaluate Decoder MLP directly on query coordinates
         V_raw = self.decoder.evaluate(feat_interp, S_mesh_q, t_mesh_q,
