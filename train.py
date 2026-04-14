@@ -255,6 +255,7 @@ class FNOTrainer:
         # GCP Upload Queue (persistent worker, avoids thread pile-up)
         self._upload_queue = None
         self._upload_worker_thread = None
+        self._last_gcp_upload_epoch = -999  # Track frequency control for best.pt
         self._init_upload_queue()
 
     def _init_upload_queue(self):
@@ -834,18 +835,21 @@ class FNOTrainer:
                          hasattr(self.config, 'gcp_service_account_path') and self.config.gcp_service_account_path)
 
         if gcp_configured and self._upload_queue is not None:
-            upload_frequency = getattr(self.config, 'upload_latest_every_n_epochs', 5)
+            upload_frequency = getattr(self.config, 'upload_latest_every_n_epochs', 15)
             upload_best = getattr(self.config, 'upload_best_always', True)
             use_compression = getattr(self.config, 'compress_checkpoints', True)
 
             should_upload = False
             gcp_path = full_name
 
-            # Upload logic:
-            # 1. best.pt: always upload (if upload_best_always=True)
+            # Upload logic (all controlled by upload_frequency):
+            # 1. best.pt: only upload if enough epochs passed since last upload
             # 2. checkpoint_latest.pt: upload every N epochs
-            # 3. epoch checkpoints: always upload
-            if is_best and upload_best:
+            # 3. epoch checkpoints: upload when they're created
+            last_upload = getattr(self, '_last_gcp_upload_epoch', -upload_frequency)
+            epochs_since = (epoch + 1) - last_upload
+
+            if is_best and upload_best and epochs_since >= upload_frequency:
                 should_upload = True
             elif name == 'checkpoint_latest' and epoch is not None and (epoch + 1) % upload_frequency == 0:
                 should_upload = True
@@ -853,6 +857,9 @@ class FNOTrainer:
                 should_upload = True
 
             if should_upload:
+                # Track last upload epoch (so best.pt doesn't upload every improvement)
+                if is_best:
+                    self._last_gcp_upload_epoch = epoch + 1
                 # Compression for GCP upload (doesn't affect local file)
                 if use_compression:
                     compressed_path = path + '.gz'
