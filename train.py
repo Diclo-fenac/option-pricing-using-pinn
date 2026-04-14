@@ -390,10 +390,12 @@ class FNOTrainer:
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f'Epoch {epoch+1}', leave=False)):
             # Curriculum filtering
             if use_curriculum and 'params' in batch:
-                params = batch['params'].to(self.device)
-                mask = self.curriculum.get_active_mask(params, epoch)
+                params = batch['params']  # keep on CPU for filtering
+                mask = self.curriculum.get_active_mask(params.to(self.device), epoch)
                 if mask.sum() < 8:
                     continue
+                # Move mask to CPU for indexing
+                mask = mask.cpu()
                 batch = {k: v[mask] for k, v in batch.items()}
 
             self.optimizer.zero_grad()
