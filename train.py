@@ -156,7 +156,7 @@ class CurriculumScheduler:
 
         Parameters
         ----------
-        params : (N, 4) — [σ, r, K_norm, T_norm]
+        params : (N, 4) — [σ, r, K_raw, T]  (K is raw strike, NOT normalized)
         epoch : int
 
         Returns
@@ -165,13 +165,8 @@ class CurriculumScheduler:
         """
         sigma = params[:, 0]
         # r = params[:, 1]  # not used in curriculum
-        K_norm = params[:, 2]
-        T_norm = params[:, 3]
-
-        # Denormalize for readability
-        # K_norm = K / 100, T_norm = T / 2.0
-        K = K_norm * 100.0
-        T = T_norm * 2.0
+        K = params[:, 2]       # raw strike (e.g., 100), NOT K_norm
+        T = params[:, 3]       # raw time to expiry
 
         # Curriculum phases
         if epoch < 20:
@@ -369,7 +364,9 @@ class FNOTrainer:
                 weights = self.weighting.update_cheap([data_loss, pde_loss])
             # else: keep previous weights
 
-            weighted_loss = weights[0] * data_loss + weights[1] * pde_loss
+            weighted_loss = weights[0] * data_loss
+            if weights[1].item() > 0:
+                weighted_loss = weighted_loss + weights[1] * pde_loss
 
             weighted_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -400,7 +397,6 @@ class FNOTrainer:
         total_delta_rmse = 0.0
         total_gamma_rmse = 0.0
         total_data_loss = 0.0
-        total_pde_loss = 0.0
         
         # Subset tracking
         rel_l2_itm, rel_l2_atm, rel_l2_otm = 0.0, 0.0, 0.0
@@ -420,8 +416,8 @@ class FNOTrainer:
                 K_norm = K / 100.0
                 T_norm = T / 2.0
 
-                # Compute both data loss and PDE loss on validation
-                data_loss, pde_loss, V_pred = self._compute_loss(batch, compute_pde=True)
+                # Compute data loss only on validation (skip expensive PDE residual)
+                data_loss, _, V_pred = self._compute_loss(batch, compute_pde=False)
 
                 rmse = torch.sqrt(torch.mean((V_pred - V_true) ** 2))
                 total_rmse += rmse.item() * len(sigma)
@@ -455,7 +451,6 @@ class FNOTrainer:
                     n_itm += itm_mask.sum().item()
 
                 total_data_loss += data_loss.item() * len(sigma)
-                total_pde_loss += pde_loss.item() * len(sigma)
 
                 # Greeks accuracy (if available in batch)
                 if 'Delta' in batch and 'Gamma' in batch:
@@ -512,9 +507,8 @@ class FNOTrainer:
         total_delta_rmse /= max(n_samples, 1)
         total_gamma_rmse /= max(n_samples, 1)
 
-        # Average losses across samples
+        # Average data loss across samples
         avg_data_loss = total_data_loss / max(n_samples, 1)
-        avg_pde_loss = total_pde_loss / max(n_samples, 1)
 
         return {
             'rmse': total_rmse,
@@ -525,7 +519,6 @@ class FNOTrainer:
             'delta_rmse': total_delta_rmse,
             'gamma_rmse': total_gamma_rmse,
             'val_data_loss': avg_data_loss,
-            'val_pde_loss': avg_pde_loss,
         }
 
     def train(self, train_dataset, val_dataset, use_pde=True):
@@ -659,9 +652,7 @@ class FNOTrainer:
             self.history['val_gamma_rmse'].append(val_metrics['gamma_rmse'])
             # Record validation component losses
             self.history['val_data_loss'] = self.history.get('val_data_loss', [])
-            self.history['val_pde_loss'] = self.history.get('val_pde_loss', [])
             self.history['val_data_loss'].append(val_metrics.get('val_data_loss', 0.0))
-            self.history['val_pde_loss'].append(val_metrics.get('val_pde_loss', 0.0))
 
             # Epoch time
             self.history.setdefault('epoch_time_sec', []).append(epoch_time)
@@ -676,7 +667,6 @@ class FNOTrainer:
                     'train_data_loss': train_losses['data_loss'],
                     'train_physics_loss': train_losses['pde_loss'],
                     'val_data_loss': val_metrics.get('val_data_loss', None),
-                    'val_physics_loss': val_metrics.get('val_pde_loss', None),
                     'val_rmse': val_metrics['rmse'],
                     'val_delta_rmse': val_metrics['delta_rmse'],
                     'val_gamma_rmse': val_metrics['gamma_rmse'],

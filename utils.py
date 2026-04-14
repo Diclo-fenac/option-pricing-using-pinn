@@ -164,20 +164,25 @@ def monte_carlo_price(S, K, T, sigma, r, n_paths=100000, seed=42, option_type='c
 # PyTorch versions for GPU computation
 # =============================================================================
 
+def _normal_cdf(x):
+    """Standard normal CDF using erf (torch.normal_cdf does not exist)."""
+    return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
+
 def black_scholes_price_torch(S, K, T, sigma, r, option_type='call'):
     """
     PyTorch version of Black-Scholes pricing (supports batching on GPU).
     """
     eps = 1e-10
     sqrt_T = torch.sqrt(T.clamp(min=eps))
-    
+
     d1 = (torch.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
     d2 = d1 - sigma * sqrt_T
-    
+
     if option_type == 'call':
-        price = S * torch.normal_cdf(d1) - K * torch.exp(-r * T) * torch.normal_cdf(d2)
+        price = S * _normal_cdf(d1) - K * torch.exp(-r * T) * _normal_cdf(d2)
     else:
-        price = K * torch.exp(-r * T) * torch.normal_cdf(-d2) - S * torch.normal_cdf(-d1)
+        price = K * torch.exp(-r * T) * _normal_cdf(-d2) - S * _normal_cdf(-d1)
     
     # Handle T ≈ 0 case
     at_expiry = T <= eps
