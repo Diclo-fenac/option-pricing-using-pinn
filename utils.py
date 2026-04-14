@@ -215,7 +215,7 @@ def compute_max_error(pred, true):
 # Cloud Storage Helpers
 # =============================================================================
 
-def upload_to_gcp_bucket(local_file_path, bucket_name, destination_blob_name, service_account_json_path, atomic=True):
+def upload_to_gcp_bucket(local_file_path, bucket_name, destination_blob_name, service_account_json_path, atomic=True, storage_class='STANDARD'):
     """
     Uploads a file to a Google Cloud Storage bucket using a service account.
 
@@ -226,6 +226,7 @@ def upload_to_gcp_bucket(local_file_path, bucket_name, destination_blob_name, se
     destination_blob_name : str — destination path in GCS
     service_account_json_path : str — path to service account key
     atomic : bool — if True, upload to temp name then rename (prevents partial uploads)
+    storage_class : str — 'STANDARD', 'NEARLINE', 'COLDLINE', 'ARCHIVE'
     """
     try:
         from google.cloud import storage
@@ -244,7 +245,8 @@ def upload_to_gcp_bucket(local_file_path, bucket_name, destination_blob_name, se
         if atomic:
             temp_blob_name = destination_blob_name + '.tmp'
             temp_blob = bucket.blob(temp_blob_name)
-            print(f"Uploading {local_file_path} to gs://{bucket_name}/{temp_blob_name} (temp) ...")
+            temp_blob.storage_class = storage_class
+            print(f"Uploading {local_file_path} to gs://{bucket_name}/{temp_blob_name} (temp) [{storage_class}]...")
             temp_blob.upload_from_filename(local_file_path)
 
             # Rename: Bucket.rename_blob(old_blob, new_name) — not Blob.rename()
@@ -252,7 +254,8 @@ def upload_to_gcp_bucket(local_file_path, bucket_name, destination_blob_name, se
             print(f"✓ Upload complete: gs://{bucket_name}/{destination_blob_name}")
         else:
             blob = bucket.blob(destination_blob_name)
-            print(f"Uploading {local_file_path} to gs://{bucket_name}/{destination_blob_name} ...")
+            blob.storage_class = storage_class
+            print(f"Uploading {local_file_path} to gs://{bucket_name}/{destination_blob_name} [{storage_class}]...")
             blob.upload_from_filename(local_file_path)
             print(f"✓ Upload complete.")
 

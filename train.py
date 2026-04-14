@@ -9,9 +9,12 @@ Key upgrades:
   5. Hard-constrained boundaries (no BC loss needed)
 """
 import os
+import io
+import gzip
 import time
 import math
 import threading
+from queue import Queue
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,6 +32,10 @@ try:
     _HAS_WANDB = True
 except Exception:
     _HAS_WANDB = False
+
+# Checkpoint key sets for slim vs full uploads
+RESUME_KEYS = ['epoch', 'iteration', 'model', 'optimizer', 'scheduler']
+FULL_KEYS = RESUME_KEYS + ['history', 'config', 'run_name']
 
 
 # Adaptive Loss Weighting (NTK-based)
@@ -244,6 +251,44 @@ class FNOTrainer:
         res_dir = config.results_dir if hasattr(config, 'results_dir') else './results'
         os.makedirs(ckpt_dir, exist_ok=True)
         os.makedirs(res_dir, exist_ok=True)
+
+        # GCP Upload Queue (persistent worker, avoids thread pile-up)
+        self._upload_queue = None
+        self._upload_worker_thread = None
+        self._init_upload_queue()
+
+    def _init_upload_queue(self):
+        """Initialize persistent upload worker thread with queue."""
+        if not (hasattr(self.config, 'gcp_bucket_name') and self.config.gcp_bucket_name and
+                hasattr(self.config, 'gcp_service_account_path') and self.config.gcp_service_account_path):
+            return
+
+        maxsize = getattr(self.config, 'gcp_upload_queue_size', 3)
+        self._upload_queue = Queue(maxsize=maxsize)
+
+        def worker():
+            while True:
+                task = self._upload_queue.get()
+                if task is None:  # Poison pill
+                    break
+                local_path, dest_blob = task
+                try:
+                    from utils import upload_to_gcp_bucket
+                    upload_to_gcp_bucket(
+                        local_path,
+                        self.config.gcp_bucket_name,
+                        dest_blob,
+                        self.config.gcp_service_account_path,
+                        storage_class=getattr(self.config, 'gcp_storage_class', 'STANDARD')
+                    )
+                    print(f"[GCP Upload] ✓ {os.path.basename(local_path)} → gs://{self.config.gcp_bucket_name}/{dest_blob}")
+                except Exception as e:
+                    print(f"[GCP Upload Warning] Failed to upload {local_path}: {e}")
+                finally:
+                    self._upload_queue.task_done()
+
+        self._upload_worker_thread = threading.Thread(target=worker, daemon=True)
+        self._upload_worker_thread.start()
 
     def _init_grids(self, config):
         """Initialize S and t grids."""
@@ -690,7 +735,7 @@ class FNOTrainer:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_ctr = 0
-                self.save('best', epoch=epoch, iteration=iteration)
+                self.save('best', epoch=epoch, iteration=iteration, is_best=True)
             else:
                 patience_ctr += 1
                 if patience_ctr >= patience:
@@ -723,19 +768,26 @@ class FNOTrainer:
 
         return self.history
 
-    def save(self, name, epoch=None, iteration=None):
-        """Save checkpoint with structured naming and async GCP upload.
+    def save(self, name, epoch=None, iteration=None, is_best=False):
+        """Save checkpoint with structured naming, compression, and optimized GCP upload.
 
         Parameters
         ----------
         name : str — 'latest', 'best', or 'epoch_{N}'
         epoch : int — current epoch number (for checkpoint metadata)
         iteration : int — current iteration (for checkpoint metadata)
+        is_best : bool — whether this is the best model so far (triggers GCP upload)
         """
         d = self.config.checkpoint_dir if hasattr(self.config, 'checkpoint_dir') else './checkpoints'
         run_name = self.config.run_name if hasattr(self.config, 'run_name') else 'model'
         full_name = f'{run_name}_{name}.pt'
         path = os.path.join(d, full_name)
+
+        # Determine checkpoint scope (slim vs full)
+        # latest checkpoints: slim (resume only, no history)
+        # best/periodic checkpoints: full (complete metadata)
+        is_slim = (name == 'checkpoint_latest')
+        keys_to_save = RESUME_KEYS if is_slim else FULL_KEYS
 
         checkpoint = {
             'epoch': epoch if epoch is not None else -1,
@@ -744,15 +796,27 @@ class FNOTrainer:
             'model': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
-            'history': self.history,
-            'config': {
+        }
+
+        # Add history and config only for full checkpoints
+        if not is_slim:
+            checkpoint['history'] = self.history
+            checkpoint['config'] = {
                 'S_grid_size': getattr(self.config, 'S_grid_size', None),
                 't_grid_size': getattr(self.config, 't_grid_size', None),
                 'fno_modes': getattr(self.config, 'fno_modes', None),
                 'fno_layers': getattr(self.config, 'fno_layers', None),
                 'fno_width': getattr(self.config, 'fno_width', None),
             }
-        }
+        else:
+            # Slim checkpoints: minimal config needed for resume
+            checkpoint['config'] = {
+                'S_grid_size': getattr(self.config, 'S_grid_size', None),
+                't_grid_size': getattr(self.config, 't_grid_size', None),
+                'fno_modes': getattr(self.config, 'fno_modes', None),
+                'fno_layers': getattr(self.config, 'fno_layers', None),
+                'fno_width': getattr(self.config, 'fno_width', None),
+            }
 
         torch.save(checkpoint, path)
 
@@ -763,33 +827,65 @@ class FNOTrainer:
             except Exception:
                 pass
 
-        # Async GCP Upload (non-blocking)
-        if hasattr(self.config, 'gcp_bucket_name') and self.config.gcp_bucket_name and \
-           hasattr(self.config, 'gcp_service_account_path') and self.config.gcp_service_account_path:
-            gcp_prefix = getattr(self.config, 'gcp_prefix', 'pinns')
-            dest_blob = f"{gcp_prefix}/{run_name}/{full_name}"
-            thread = threading.Thread(
-                target=self._upload_to_gcp_async,
-                args=(path, dest_blob),
-                daemon=True
-            )
-            thread.start()
+        # GCP Upload with frequency control and compression
+        gcp_configured = (hasattr(self.config, 'gcp_bucket_name') and self.config.gcp_bucket_name and
+                         hasattr(self.config, 'gcp_service_account_path') and self.config.gcp_service_account_path)
 
-    def _upload_to_gcp_async(self, local_path, dest_blob):
-        """Async GCP upload in a background thread to avoid blocking training."""
+        if gcp_configured and self._upload_queue is not None:
+            upload_frequency = getattr(self.config, 'upload_latest_every_n_epochs', 5)
+            upload_best = getattr(self.config, 'upload_best_always', True)
+            use_compression = getattr(self.config, 'compress_checkpoints', True)
+
+            should_upload = False
+            gcp_path = full_name
+
+            # Upload logic:
+            # 1. best.pt: always upload (if upload_best_always=True)
+            # 2. checkpoint_latest.pt: upload every N epochs
+            # 3. epoch checkpoints: always upload
+            if is_best and upload_best:
+                should_upload = True
+            elif name == 'checkpoint_latest' and epoch is not None and (epoch + 1) % upload_frequency == 0:
+                should_upload = True
+            elif name.startswith('checkpoint_epoch_'):
+                should_upload = True
+
+            if should_upload:
+                # Compression for GCP upload (doesn't affect local file)
+                if use_compression:
+                    compressed_path = path + '.gz'
+                    self._save_compressed_checkpoint(path, compressed_path)
+                    upload_path = compressed_path
+                    gcp_path = full_name + '.gz'
+                else:
+                    upload_path = path
+                    gcp_path = full_name
+
+                # Queue upload (non-blocking, backpressure via queue size)
+                gcp_prefix = getattr(self.config, 'gcp_prefix', 'pinns')
+                dest_blob = f"{gcp_prefix}/{run_name}/{gcp_path}"
+
+                try:
+                    self._upload_queue.put_nowait((upload_path, dest_blob))
+                except Exception as e:
+                    print(f"[GCP Upload Warning] Queue full, skipping upload: {e}")
+
+    def _save_compressed_checkpoint(self, src_path, dest_path):
+        """Save compressed checkpoint with gzip (level=1 for speed)."""
         try:
-            from utils import upload_to_gcp_bucket
-            upload_to_gcp_bucket(
-                local_path,
-                self.config.gcp_bucket_name,
-                dest_blob,
-                self.config.gcp_service_account_path
-            )
+            with open(src_path, 'rb') as f:
+                data = f.read()
+            with gzip.open(dest_path, 'wb', compresslevel=1) as gz:
+                gz.write(data)
         except Exception as e:
-            print(f"[GCP Upload Warning] Failed to upload {local_path}: {e}")
+            # Fallback: copy original if compression fails
+            import shutil
+            shutil.copy2(src_path, dest_path.replace('.gz', ''))
+            print(f"[Compression Warning] Failed: {e}, using uncompressed")
 
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint and restore model, optimizer, scheduler, and history.
+        Supports both compressed (.gz) and uncompressed checkpoints.
 
         Parameters
         ----------
@@ -807,7 +903,13 @@ class FNOTrainer:
         print(f"Loading checkpoint: {checkpoint_path}")
         print(f"{'='*60}\n")
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        # Handle compressed checkpoints
+        if checkpoint_path.endswith('.gz'):
+            with gzip.open(checkpoint_path, 'rb') as f:
+                buffer = io.BytesIO(f.read())
+            checkpoint = torch.load(buffer, map_location=self.device)
+        else:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
         # Load model state
         self.model.load_state_dict(checkpoint['model'])
@@ -970,10 +1072,18 @@ class FNOTrainer:
 
 
 def load_model(config, path):
-    """Load trained model."""
+    """Load trained model. Supports both compressed (.gz) and uncompressed checkpoints."""
     device = torch.device(config.device if hasattr(config, 'device') else 'cuda')
     model = FNOOptionPricer(config).to(device)
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+
+    # Handle compressed checkpoints
+    if path.endswith('.gz'):
+        with gzip.open(path, 'rb') as f:
+            buffer = io.BytesIO(f.read())
+        ckpt = torch.load(buffer, map_location=device, weights_only=False)
+    else:
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+
     model.load_state_dict(ckpt['model'])
     model.eval()
     return model, device
@@ -1073,13 +1183,38 @@ def train_model(config):
         run_name = config.run_name if hasattr(config, 'run_name') else 'model'
         d = config.checkpoint_dir if hasattr(config, 'checkpoint_dir') else './checkpoints'
         gcp_prefix = getattr(config, 'gcp_prefix', 'pinns')
+        use_compression = getattr(config, 'compress_checkpoints', True)
 
         for name in ['best', 'final', 'checkpoint_latest']:
             full_name = f'{run_name}_{name}.pt'
             path = os.path.join(d, full_name)
             if os.path.exists(path):
-                dest_blob = f"{gcp_prefix}/{run_name}/{full_name}"
-                upload_to_gcp_bucket(path, config.gcp_bucket_name, dest_blob, config.gcp_service_account_path)
+                # Compress if enabled
+                if use_compression:
+                    compressed_path = path + '.gz'
+                    try:
+                        import gzip
+                        with open(path, 'rb') as f:
+                            data = f.read()
+                        with gzip.open(compressed_path, 'wb', compresslevel=1) as gz:
+                            gz.write(data)
+                        upload_path = compressed_path
+                        dest_blob = f"{gcp_prefix}/{run_name}/{full_name}.gz"
+                    except Exception as e:
+                        print(f"[Compression Warning] {e}, uploading uncompressed")
+                        upload_path = path
+                        dest_blob = f"{gcp_prefix}/{run_name}/{full_name}"
+                else:
+                    upload_path = path
+                    dest_blob = f"{gcp_prefix}/{run_name}/{full_name}"
+
+                upload_to_gcp_bucket(
+                    upload_path,
+                    config.gcp_bucket_name,
+                    dest_blob,
+                    config.gcp_service_account_path,
+                    storage_class=getattr(config, 'gcp_storage_class', 'STANDARD')
+                )
 
     # Optional: Run full benchmark suite immediately after training
     if hasattr(config, 'run_benchmark') and config.run_benchmark:
@@ -1099,6 +1234,7 @@ def train_model(config):
 def load_checkpoint_for_resume(checkpoint_path, device=None):
     """
     Load a checkpoint and return its metadata for inspection or manual resume.
+    Supports both compressed (.gz) and uncompressed checkpoints.
 
     Parameters
     ----------
@@ -1115,7 +1251,14 @@ def load_checkpoint_for_resume(checkpoint_path, device=None):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Handle compressed checkpoints
+    if checkpoint_path.endswith('.gz'):
+        import gzip
+        with gzip.open(checkpoint_path, 'rb') as f:
+            buffer = io.BytesIO(f.read())
+        checkpoint = torch.load(buffer, map_location=device)
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
 
     print(f"\n{'='*60}")
     print(f"Checkpoint: {checkpoint_path}")

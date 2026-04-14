@@ -87,9 +87,23 @@ class Config:
     gcp_service_account_path = None      # e.g., './service-account-key.json'
     gcp_prefix = 'pinns'                 # GCS prefix: gs://bucket/{gcp_prefix}/{run_name}/
 
+    # GCP Upload Optimization
+    upload_latest_every_n_epochs = 15    # Upload checkpoint_latest.pt to GCP every N epochs
+    upload_best_always = True            # Always upload best.pt to GCP on improvement
+    compress_checkpoints = True          # Compress checkpoints with gzip before GCP upload
+    gcp_storage_class = 'STANDARD'       # 'STANDARD', 'NEARLINE', 'COLDLINE', 'ARCHIVE'
+    gcp_upload_queue_size = 3            # Max pending uploads in queue (backpressure)
+
+    # GCP Storage Lifecycle / Cost Optimization
+    # NOTE: These are documented for manual setup (not auto-applied):
+    #   1. Set lifecycle rule to delete checkpoint_epoch_*.pt older than 30 days
+    #   2. Use Nearline storage class for periodic checkpoints (accessed < monthly)
+    #   3. Ensure bucket is same region as training VM (eliminates egress fees)
+    #   4. Disable object versioning on checkpoint bucket (avoids 2-3x storage blowup)
+
     # Checkpointing
     save_every_n_epochs = 15             # Save epoch checkpoint every N epochs
-    save_latest_every_epoch = 1          # Save checkpoint_latest.pt every N epochs
+    save_latest_every_epoch = 1          # Save checkpoint_latest.pt locally every N epochs
     resume_from_checkpoint = None        # Path to checkpoint to resume from
     
     # =============================================================================
