@@ -52,7 +52,7 @@ class AdaptiveLossWeights:
       - SoftAdapt: "Dynamic loss weighting for physics-informed neural networks"
     """
 
-    def __init__(self, n_terms, alpha=0.9, min_weight=0.01, max_weight=100.0):
+    def __init__(self, n_terms, alpha=0.9, min_weight=0.01, max_weight=1e6):
         """
         Parameters
         ----------
@@ -130,17 +130,18 @@ class AdaptiveLossWeights:
         losses = torch.tensor([l.item() + 1e-12 for l in loss_terms], device=loss_terms[0].device)
 
         if self.loss_ema is None:
-            self.loss_ema = torch.ones(self.n_terms, device=loss_terms[0].device)
+            self.loss_ema = losses.clone()
 
         # EMA of loss magnitudes
         self.loss_ema = self.alpha * self.loss_ema + (1 - self.alpha) * losses
 
-        # Inverse-ratio weighting
-        ratios = self.loss_ema / self.loss_ema.sum()
-        weights = 1.0 / (ratios * self.n_terms)
+        # Scale all terms to the data-loss reference. This keeps extreme PDE
+        # loss spikes from dominating the weighted objective.
+        ref = self.loss_ema[0]
+        weights = ref / self.loss_ema.clamp(min=1e-12)
         weights = weights.clamp(self.min_w, self.max_w)
 
-        return weights.to(loss_terms[0].device)
+        return weights.detach().to(loss_terms[0].device)
 
 
 # Curriculum Scheduler
@@ -293,7 +294,7 @@ class FNOTrainer:
 
     def _init_grids(self, config):
         """Initialize S and t grids."""
-        # S grid: linear from S_min to S_max
+        # S grid: log-spaced from S_min to S_max to match decoder log-S normalization
         S_min = config.S_min if hasattr(config, 'S_min') else 1e-3
         S_max = config.S_max if hasattr(config, 'S_max') else 600.0
         n_S = config.S_grid_size if hasattr(config, 'S_grid_size') else 256
@@ -301,7 +302,10 @@ class FNOTrainer:
         t_power = config.t_sampling_power if hasattr(config, 't_sampling_power') else 2.0
         T_max = config.T_max if hasattr(config, 'T_max') else 2.0
 
-        self.S_grid = torch.linspace(S_min, S_max, n_S, dtype=torch.float32, device=self.device)
+        S_log_min = math.log(S_min)
+        S_log_max = math.log(S_max)
+        S_grid_log = torch.linspace(S_log_min, S_log_max, n_S, dtype=torch.float32, device=self.device)
+        self.S_grid = torch.exp(S_grid_log)
         t_u = torch.linspace(0, 1, n_t, dtype=torch.float32, device=self.device) ** t_power
         self.t_grid = t_u * T_max
 
@@ -309,12 +313,15 @@ class FNOTrainer:
         # Avoid boundaries where derivatives are noisy
         n_interior_S = max(32, n_S // 4)
         n_interior_t = max(16, n_t // 2)
-        self.S_interior = torch.linspace(S_min * 1.1, S_max * 0.9, n_interior_S,
-                                         dtype=torch.float32, device=self.device)
+        S_interior_log = torch.linspace(
+            math.log(S_min * 1.1), math.log(S_max * 0.9),
+            n_interior_S, dtype=torch.float32, device=self.device
+        )
+        self.S_interior = torch.exp(S_interior_log)
         self.t_interior = torch.linspace(T_max * 0.05, T_max * 0.95, n_interior_t,
                                          dtype=torch.float32, device=self.device)
 
-        print(f"Grid: S∈[{S_min:.2f},{S_max:.1f}] ({n_S}), t∈[0,{T_max}] ({n_t})")
+        print(f"Grid: S∈[{S_min:.2f},{S_max:.1f}] ({n_S}, log-spaced), t∈[0,{T_max}] ({n_t})")
         print(f"PDE interior: {n_interior_S} × {n_interior_t} points")
 
     def _compute_loss(self, batch, compute_pde=True):
@@ -344,12 +351,15 @@ class FNOTrainer:
         pde_loss = torch.tensor(0.0, device=self.device)
         if compute_pde:
             # Only compute PDE on a subset for efficiency (every 3rd batch)
-            residual, dV_dS, d2V_dS2, dV_dt = compute_pde_residual_autograd(
+            residual, dV_dS, d2V_dS2, dV_dt, V_pde = compute_pde_residual_autograd(
                 self.model, sigma, r, K_norm, T_norm,
                 self.S_grid, self.t_grid,
-                self.S_interior, self.t_interior
+                self.S_interior, self.t_interior,
+                return_value=True
             )
-            pde_loss = torch.mean(residual ** 2)
+            # Normalize PDE residual by option-price scale per sample.
+            V_scale = V_pde.detach().abs().mean(dim=(1, 2), keepdim=True).clamp(min=1.0)
+            pde_loss = torch.mean((residual / V_scale) ** 2)
 
             # Sobolev Loss: Match AD derivatives with true Delta and Gamma on the interior points
             # DISABLED: The current AD setup computes global gradients (summed over batch/time),
@@ -387,16 +397,16 @@ class FNOTrainer:
         epoch_pde_loss = 0.0
         n_batches = 0
         weights = torch.tensor([1.0, 0.0], device=self.device)
+        if epoch == 5 and use_pde:
+            self.weighting.loss_ema = None
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f'Epoch {epoch+1}', leave=False)):
             # Curriculum filtering
             if use_curriculum and 'params' in batch:
                 params = batch['params']  # keep on CPU for filtering
-                mask = self.curriculum.get_active_mask(params.to(self.device), epoch)
+                mask = self.curriculum.get_active_mask(params, epoch)
                 if mask.sum() < 8:
                     continue
-                # Move mask to CPU for indexing
-                mask = mask.cpu()
                 batch = {k: v[mask] for k, v in batch.items()}
 
             self.optimizer.zero_grad()
@@ -506,15 +516,17 @@ class FNOTrainer:
                     Gamma_true = batch['Gamma'].to(self.device)
 
                     with torch.enable_grad():
-                        # Compute Greeks via AD
-                        # Use middle of S grid and middle of time grid
+                        # Compute Greeks via AD at each sample's ATM point and middle time.
                         n_S = len(self.S_grid)
                         n_t = len(self.t_grid)
-                        S_ref = self.S_grid[n_S // 2:n_S // 2 + 1]
                         t_ref = self.t_grid[n_t // 2:n_t // 2 + 1]
                         
                         batch_size = sigma.shape[0]
-                        S_q = S_ref.unsqueeze(0).expand(batch_size, -1).detach().clone().requires_grad_(True)
+                        S_atm_idx = torch.argmin(
+                            (self.S_grid.unsqueeze(0) - K.unsqueeze(1)).abs(), dim=1
+                        )
+                        S_ref = self.S_grid[S_atm_idx].unsqueeze(1)
+                        S_q = S_ref.detach().clone().requires_grad_(True)
                         t_q = t_ref.unsqueeze(0).expand(batch_size, -1).detach().clone().requires_grad_(True)
     
                         V_q = self.model.query(sigma, r, K_norm, T_norm, S_q, t_q,
@@ -522,16 +534,18 @@ class FNOTrainer:
     
                         # AD derivatives
                         dV_dS = torch.autograd.grad(V_q.sum(), S_q, create_graph=True, retain_graph=True)[0]
-                        d2V_dS2 = torch.autograd.grad(dV_dS.sum(), S_q, create_graph=False)[0]
+                        grad2 = torch.autograd.grad(
+                            dV_dS[:, 0].sum(), S_q, create_graph=False, retain_graph=False
+                        )[0]
 
                     # Extract at reference point (middle of S grid, middle of time grid)
                     Delta_pred = dV_dS  # (batch, 1)
-                    Gamma_pred = d2V_dS2  # (batch, 1)
+                    Gamma_pred = grad2  # (batch, 1)
 
-                    # True Greeks at same point (middle S, middle t)
-                    # Delta_true: (batch, n_S, n_t) → extract middle
-                    Delta_true_ref = Delta_true[:, n_S // 2, n_t // 2]
-                    Gamma_true_ref = Gamma_true[:, n_S // 2, n_t // 2]
+                    # True Greeks at same ATM S index and middle t.
+                    batch_indices = torch.arange(batch_size, device=self.device)
+                    Delta_true_ref = Delta_true[batch_indices, S_atm_idx, n_t // 2]
+                    Gamma_true_ref = Gamma_true[batch_indices, S_atm_idx, n_t // 2]
 
                     delta_rmse = torch.sqrt(torch.mean(
                         (Delta_pred.view(-1) - Delta_true_ref) ** 2

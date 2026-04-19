@@ -248,9 +248,9 @@ def compute_gamma(sigma, r, K, T, S_grid, t_template):
 # Grid Construction
 
 def create_s_grid(S_min: float, K_max: float, n_S: int) -> np.ndarray:
-    """Linear S grid: [S_min, 3·K_max]."""
+    """Log-spaced S grid: [S_min, 3·K_max]."""
     S_max = 3.0 * K_max
-    return np.linspace(S_min, S_max, n_S, dtype=np.float32)
+    return np.exp(np.linspace(np.log(S_min), np.log(S_max), n_S)).astype(np.float32)
 
 
 def create_t_template(n_t: int, power: float = 2.0) -> np.ndarray:
@@ -472,7 +472,7 @@ def generate_data(config: Optional[Config] = None):
     S_grid = create_s_grid(config.S_min, config.K_max, config.S_grid_size)
     t_template = create_t_template(config.t_grid_size, config.t_sampling_power)
 
-    print(f"S_grid: [{S_grid.min():.4f}, {S_grid.max():.4f}] ({config.S_grid_size} pts, linear)")
+    print(f"S_grid: [{S_grid.min():.4f}, {S_grid.max():.4f}] ({config.S_grid_size} pts, log-spaced)")
     print(f"t_template: [0, 1] ({config.t_grid_size} pts, power={config.t_sampling_power})")
 
     params, V, Delta, Gamma = generate_full_dataset(

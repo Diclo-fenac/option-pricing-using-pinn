@@ -244,8 +244,11 @@ class HardConstrainedOutput(nn.Module):
 
         modulation = tau * S_mod * sigmoid_tau
 
-        # Hard-constrained output (apply payoff purely as terminal constraint)
-        V = payoff * (tau <= 1e-8).float() + V_raw * modulation
+        # Hard-constrained output (apply payoff purely as terminal constraint).
+        # Detach the kinked payoff branch so interior second derivatives are
+        # governed by the smooth raw-output path.
+        boundary_mask = (tau <= 1e-8).float().detach()
+        V = payoff.detach() * boundary_mask + V_raw * modulation
 
         return V
 
@@ -424,21 +427,19 @@ class FNOOptionPricer(nn.Module):
         if S_q.dim() == 1:
             n_qS, n_qt = S_q.shape[0], t_q.shape[0]
     
-            # Normalize query coordinates to [0, n-1] index space
-            s_idx = (S_q - S_grid[0]) / (S_grid[-1] - S_grid[0] + 1e-8) * (n_S - 1)
-            t_idx = (t_q - t_grid[0]) / (t_grid[-1] - t_grid[0] + 1e-8) * (n_t - 1)
-    
-            s_idx = s_idx.clamp(0, n_S - 2)
-            t_idx = t_idx.clamp(0, n_t - 2)
-    
-            s0 = s_idx.floor().long()
-            s1 = s0 + 1
-            t0 = t_idx.floor().long()
-            t1 = t0 + 1
-    
-            # Interpolation weights — first-order gradient path through s_idx, t_idx
-            ws = s_idx - s0.float()  # (n_qS,)
-            wt = t_idx - t0.float()  # (n_qt,)
+            s1 = torch.searchsorted(S_grid, S_q, right=False).clamp(1, n_S - 1)
+            s0 = s1 - 1
+            t1 = torch.searchsorted(t_grid, t_q, right=False).clamp(1, n_t - 1)
+            t0 = t1 - 1
+
+            s_left = S_grid[s0]
+            s_right = S_grid[s1]
+            t_left = t_grid[t0]
+            t_right = t_grid[t1]
+
+            # Interpolation weights — first-order gradient path through S_q, t_q.
+            ws = ((S_q - s_left) / (s_right - s_left + 1e-8)).clamp(0.0, 1.0)
+            wt = ((t_q - t_left) / (t_right - t_left + 1e-8)).clamp(0.0, 1.0)
     
             b_idx = torch.arange(batch, device=V.device)[:, None, None, None]
             w_idx = torch.arange(width, device=V.device)[None, :, None, None]
@@ -455,19 +456,18 @@ class FNOOptionPricer(nn.Module):
         else:
             n_qS, n_qt = S_q.shape[1], t_q.shape[1]
     
-            s_idx = (S_q - S_grid[0]) / (S_grid[-1] - S_grid[0] + 1e-8) * (n_S - 1)
-            t_idx = (t_q - t_grid[0]) / (t_grid[-1] - t_grid[0] + 1e-8) * (n_t - 1)
-    
-            s_idx = s_idx.clamp(0, n_S - 2)
-            t_idx = t_idx.clamp(0, n_t - 2)
-    
-            s0 = s_idx.floor().long()
-            s1 = s0 + 1
-            t0 = t_idx.floor().long()
-            t1 = t0 + 1
-    
-            ws = s_idx - s0.float()  # (batch, n_qS)
-            wt = t_idx - t0.float()  # (batch, n_qt)
+            s1 = torch.searchsorted(S_grid, S_q, right=False).clamp(1, n_S - 1)
+            s0 = s1 - 1
+            t1 = torch.searchsorted(t_grid, t_q, right=False).clamp(1, n_t - 1)
+            t0 = t1 - 1
+
+            s_left = S_grid[s0]
+            s_right = S_grid[s1]
+            t_left = t_grid[t0]
+            t_right = t_grid[t1]
+
+            ws = ((S_q - s_left) / (s_right - s_left + 1e-8)).clamp(0.0, 1.0)
+            wt = ((t_q - t_left) / (t_right - t_left + 1e-8)).clamp(0.0, 1.0)
     
             b_idx = torch.arange(batch, device=V.device)[:, None, None, None]
             w_idx = torch.arange(width, device=V.device)[None, :, None, None]
@@ -487,16 +487,13 @@ class FNOOptionPricer(nn.Module):
 # AD-based PDE Residual & Greeks
 
 def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
-                                   S_grid, t_grid, S_interp, t_interp):
+                                   S_grid, t_grid, S_interp, t_interp,
+                                   return_value=False):
     """
     Compute Black-Scholes PDE residual using Automatic Differentiation
-    in log-S coordinates for numerical stability.
+    in raw S coordinates:
 
-    Let x = log(S). The BS PDE becomes:
-      ∂V/∂t + ½σ²(∂²V/∂x²) + (r - ½σ²)(∂V/∂x) - rV = 0
-
-    This eliminates the S² amplification factor that causes instability
-    with raw S coordinates (S up to 600 → S² up to 360,000×).
+      ∂V/∂t + ½σ²S²∂²V/∂S² + rS∂V/∂S - rV = 0
 
     Parameters
     ----------
@@ -509,6 +506,7 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
     -------
     residual : (batch, n_qS, n_qt) — should be ≈ 0
     dV_dS, d2V_dS2, dV_dt : Greeks for debugging (in original S coords)
+    V : returned only when return_value=True
     """
     with torch.enable_grad():
         batch = sigma.shape[0]
@@ -520,17 +518,25 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
         # Forward through model with raw S coordinates
         V = model.query(sigma, r, K_norm, T_norm, S_q, t_q, S_grid, t_grid)
 
-        # ∂V/S via autograd (raw S coords)
+        # ∂V/∂S via autograd (raw S coords)
         dV_dS = torch.autograd.grad(
             V.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
         )[0]
         dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_q).requires_grad_(True)
 
-        # ∂²V/∂S² via autograd (raw S coords)
-        d2V_dS2 = torch.autograd.grad(
-            dV_dS.sum(), S_q, create_graph=True, retain_graph=True, allow_unused=True
-        )[0]
-        d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_q).requires_grad_(True)
+        # Extract only diagonal Hessian entries d²V_i/dS_i². Summing all deltas
+        # before differentiating mixes cross-derivatives through shared features.
+        d2V_dS2_rows = []
+        for i in range(S_q.shape[1]):
+            grad2_i = torch.autograd.grad(
+                dV_dS[:, i].sum(), S_q,
+                create_graph=True, retain_graph=True, allow_unused=True
+            )[0]
+            if grad2_i is None:
+                d2V_dS2_rows.append(torch.zeros(S_q.shape[0], device=S_q.device, dtype=S_q.dtype))
+            else:
+                d2V_dS2_rows.append(grad2_i[:, i])
+        d2V_dS2 = torch.stack(d2V_dS2_rows, dim=1)
 
         # ∂V/∂t
         dV_dt = torch.autograd.grad(
@@ -538,26 +544,21 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
         )[0]
         dV_dt = dV_dt if dV_dt is not None else torch.zeros_like(t_q).requires_grad_(True)
 
-        # Convert to log-S derivatives via chain rule:
-        # x = log(S) → dV/dx = S · dV/dS
-        # d²V/dx² = S² · d²V/dS² + S · dV/dS
-        dV_dx = S_q * dV_dS
-        d2V_dx2 = S_q ** 2 * d2V_dS2 + S_q * dV_dS
-
-        # Black-Scholes PDE residual in log-S form
-        # ∂V/∂t + ½σ²(∂²V/∂x²) + (r - ½σ²)(∂V/∂x) - rV = 0
-        # Shapes: dV_dx, d2V_dx2 ~ (batch, n_qS), dV_dt ~ (batch, n_qt)
-        dV_dx_3d = dV_dx.unsqueeze(-1)       # (batch, n_qS, 1)
-        d2V_dx2_3d = d2V_dx2.unsqueeze(-1)   # (batch, n_qS, 1)
+        # Black-Scholes PDE residual in raw S form.
+        dV_dS_3d = dV_dS.unsqueeze(-1)       # (batch, n_qS, 1)
+        d2V_dS2_3d = d2V_dS2.unsqueeze(-1)   # (batch, n_qS, 1)
         dV_dt_3d = dV_dt.unsqueeze(1)        # (batch, 1, n_qt)
+        S_3d = S_q.unsqueeze(-1)             # (batch, n_qS, 1)
         sigma_3d = sigma.view(-1, 1, 1)
         r_3d = r.view(-1, 1, 1)
 
         residual = (dV_dt_3d
-                    + 0.5 * sigma_3d**2 * d2V_dx2_3d
-                    + (r_3d - 0.5 * sigma_3d**2) * dV_dx_3d
+                    + 0.5 * sigma_3d**2 * S_3d**2 * d2V_dS2_3d
+                    + r_3d * S_3d * dV_dS_3d
                     - r_3d * V)
 
+        if return_value:
+            return residual, dV_dS, d2V_dS2, dV_dt, V
         return residual, dV_dS, d2V_dS2, dV_dt
 
 
@@ -582,9 +583,20 @@ def compute_greeks_autograd(model, sigma, r, K_norm, T_norm,
         )[0]
         dV_dS = dV_dS if dV_dS is not None else torch.zeros_like(S_query_batched).requires_grad_(True)
     
-        d2V_dS2 = torch.autograd.grad(
-            dV_dS.sum(), S_query_batched, create_graph=True, retain_graph=True, allow_unused=True
-        )[0]
-        d2V_dS2 = d2V_dS2 if d2V_dS2 is not None else torch.zeros_like(S_query_batched).requires_grad_(True)
+        d2V_dS2_rows = []
+        for i in range(S_query_batched.shape[1]):
+            grad2_i = torch.autograd.grad(
+                dV_dS[:, i].sum(), S_query_batched,
+                create_graph=True, retain_graph=True, allow_unused=True
+            )[0]
+            if grad2_i is None:
+                d2V_dS2_rows.append(torch.zeros(
+                    S_query_batched.shape[0],
+                    device=S_query_batched.device,
+                    dtype=S_query_batched.dtype
+                ))
+            else:
+                d2V_dS2_rows.append(grad2_i[:, i])
+        d2V_dS2 = torch.stack(d2V_dS2_rows, dim=1)
     
         return dV_dS, d2V_dS2
