@@ -52,7 +52,7 @@ class AdaptiveLossWeights:
       - SoftAdapt: "Dynamic loss weighting for physics-informed neural networks"
     """
 
-    def __init__(self, n_terms, alpha=0.9, min_weight=0.01, max_weight=1e6):
+    def __init__(self, n_terms, alpha=0.9, min_weight=1e-6, max_weight=1e6):
         """
         Parameters
         ----------
@@ -370,9 +370,8 @@ class FNOTrainer:
                 self.S_interior, self.t_interior,
                 return_value=True
             )
-            # Normalize PDE residual by option-price scale per sample.
-            V_scale = V_pde.detach().abs().mean(dim=(1, 2), keepdim=True).clamp(min=1.0)
-            pde_loss = torch.mean((residual / V_scale) ** 2)
+            # compute_pde_residual_autograd returns a price-scale-normalized residual.
+            pde_loss = torch.mean(residual ** 2)
 
             # Sobolev Loss: Match AD derivatives with true Delta and Gamma on the interior points
             # DISABLED: The current AD setup computes global gradients (summed over batch/time),

@@ -556,6 +556,8 @@ def compute_pde_residual_autograd(model, sigma, r, K_norm, T_norm,
                     + 0.5 * sigma_3d**2 * S_3d**2 * d2V_dS2_3d
                     + r_3d * S_3d * dV_dS_3d
                     - r_3d * V)
+        V_scale = V.detach().abs().mean(dim=(1, 2), keepdim=True).clamp(min=1.0)
+        residual = residual / V_scale
 
         if return_value:
             return residual, dV_dS, d2V_dS2, dV_dt, V
