@@ -309,10 +309,10 @@ class FNOTrainer:
         t_u = torch.linspace(0, 1, n_t, dtype=torch.float32, device=self.device) ** t_power
         self.t_grid = t_u * T_max
 
-        # Interior points for PDE residual evaluation
-        # Avoid boundaries where derivatives are noisy
-        n_interior_S = max(32, n_S // 4)
-        n_interior_t = max(16, n_t // 2)
+        # Interior points for PDE residual evaluation. Keep this grid small:
+        # second derivatives retain a large higher-order graph during backward.
+        n_interior_S = min(n_S, max(2, getattr(config, 'pde_n_S', 16)))
+        n_interior_t = min(n_t, max(2, getattr(config, 'pde_n_t', 8)))
         S_interior_log = torch.linspace(
             math.log(S_min * 1.1), math.log(S_max * 0.9),
             n_interior_S, dtype=torch.float32, device=self.device
@@ -350,9 +350,22 @@ class FNOTrainer:
         # PDE residual loss (AD-based)
         pde_loss = torch.tensor(0.0, device=self.device)
         if compute_pde:
-            # Only compute PDE on a subset for efficiency (every 3rd batch)
+            pde_batch_size = getattr(self.config, 'pde_batch_size', 8)
+            if pde_batch_size is not None and pde_batch_size > 0 and sigma.shape[0] > pde_batch_size:
+                pde_idx = torch.randperm(sigma.shape[0], device=self.device)[:pde_batch_size]
+                sigma_pde = sigma[pde_idx]
+                r_pde = r[pde_idx]
+                K_norm_pde = K_norm[pde_idx]
+                T_norm_pde = T_norm[pde_idx]
+            else:
+                sigma_pde = sigma
+                r_pde = r
+                K_norm_pde = K_norm
+                T_norm_pde = T_norm
+
+            # Only compute PDE on a small collocation/sub-batch for efficiency.
             residual, dV_dS, d2V_dS2, dV_dt, V_pde = compute_pde_residual_autograd(
-                self.model, sigma, r, K_norm, T_norm,
+                self.model, sigma_pde, r_pde, K_norm_pde, T_norm_pde,
                 self.S_grid, self.t_grid,
                 self.S_interior, self.t_interior,
                 return_value=True
@@ -411,14 +424,17 @@ class FNOTrainer:
 
             self.optimizer.zero_grad()
 
+            pde_every_n_batches = max(1, getattr(self.config, 'pde_every_n_batches', 3))
+            compute_pde = use_pde and (batch_idx % pde_every_n_batches == 0)
+
             # Compute losses (skip PDE if use_pde=False)
-            data_loss, pde_loss, _ = self._compute_loss(batch, compute_pde=use_pde and (batch_idx % 3 == 0))
+            data_loss, pde_loss, _ = self._compute_loss(batch, compute_pde=compute_pde)
 
             # Adaptive weighting
             if epoch < 5 or not use_pde:
                 # Warm-up or data-only: data loss only
                 weights = torch.tensor([1.0, 0.0], device=self.device)
-            elif use_pde and (batch_idx % 3 == 0):
+            elif compute_pde:
                 weights = self.weighting.update_cheap([data_loss, pde_loss])
             # else: keep previous weights
 

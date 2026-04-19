@@ -59,6 +59,10 @@ class Config:
     # Physics-informed loss weight
     lambda_pde = 0.1           # Weight for PDE residual loss
     lambda_bc = 0.1            # Weight for boundary condition loss
+    pde_n_S = 16               # PDE collocation points along S (AD is memory heavy)
+    pde_n_t = 8                # PDE collocation points along t
+    pde_batch_size = 8         # Sub-batch used for PDE residual; None/0 uses full batch
+    pde_every_n_batches = 3    # Compute PDE residual every N batches
     
     # Dataloader / multiprocessing (set lower/disabled for notebook stability)
     num_workers = 0
