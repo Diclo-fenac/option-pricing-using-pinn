@@ -62,15 +62,6 @@ Implementation_B/
 └── README.md
 ```
 
-## Key Results (Expected)
-
-| Metric | Target |
-|--------|--------|
-| Pricing RMSE | < 0.01 |
-| Inference time | < 1ms |
-| Speedup vs MC | 100-1000x |
-| Delta RMSE | < 0.01 |
-
 ## Mathematical Background
 
 The Black–Scholes PDE:
